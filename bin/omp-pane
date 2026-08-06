@@ -37,10 +37,13 @@ mkdir -p "$hint_dir"
 badge_label="omp (sleeping)"
 
 herdr_req() {
-	[ -n "${HERDR_SOCKET_PATH:-}" ] && [ -n "${HERDR_PANE_ID:-}" ] || return 0
+	# The socket path is in every pane's env; fall back to the default so the
+	# reaper — which runs from launchd with no pane around it — can reuse this.
+	local sock=${HERDR_SOCKET_PATH:-$HOME/.config/herdr/herdr.sock}
+	[ -S "$sock" ] && [ -n "${HERDR_PANE_ID:-}" ] || return 0
 	printf '{"id":"omp-pane","method":"pane.%s","params":{"pane_id":"%s","seq":%s%s}}\n' \
 		"$1" "$HERDR_PANE_ID" "$(( ($(date +%s) + 1) * 1000000 ))" "$2" |
-		nc -U "$HERDR_SOCKET_PATH" >/dev/null 2>&1 || true
+		nc -U "$sock" >/dev/null 2>&1 || true
 }
 
 # Take the pane over from the session that just exited, then claim it as a
@@ -54,6 +57,19 @@ badge_sleeping() {
 badge_awake() {
 	herdr_req release_agent ",\"source\":\"omp-pane\",\"agent\":\"$badge_label\""
 }
+
+# Label a pane that is already parked, from outside it.
+#
+# bash freezes a script's body at exec, so a wrapper that has been running
+# since before the badge existed can never grow it — and a long-lived wrapper
+# never re-execs either. Such a pane sleeps correctly but herdr keeps showing
+# the dead session's green `omp`. The reaper calls this to fix those; one entry
+# point keeps the sequence rule above in a single place.
+if [ "${1:-}" = --badge ]; then
+	HERDR_PANE_ID=${2:-${HERDR_PANE_ID:-}}
+	badge_sleeping
+	exit 0
+fi
 
 # Session this pane is on. Never guesses: a wrong resume is worse than no sleep.
 resolve_session() {

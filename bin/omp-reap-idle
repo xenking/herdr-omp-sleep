@@ -9,17 +9,26 @@
 # Only touches agents herdr reports as `idle` and unfocused — never `working`
 # (running now) and never `blocked` (waiting on your answer).
 #
-# Env: IDLE_MIN (default 240), DRY_RUN=1 to only print.
+# Env: IDLE_MIN (default 15) — minutes a conversation must be untouched.
+#      EMPTY_MIN (default 4x IDLE_MIN) — omp uptime before a pane whose session
+#      has no turns at all is retired to its shell.
+#      DRY_RUN=1 to only print.
 set -euo pipefail
 
 # Default matches EnvironmentVariables.IDLE_MIN in the launchd plist, so a
 # manual run shows the same panes the scheduled one acts on.
 IDLE_MIN=${IDLE_MIN:-15}
+EMPTY_MIN=${EMPTY_MIN:-$((IDLE_MIN * 4))}
+
+# Must match badge_label in omp-pane.
+BADGE="omp (sleeping)"
 LOG="$HOME/.local/state/omp-reap.log"
 mkdir -p "$(dirname "$LOG")"
 
 now=$(date +%s)
 slept=0
+retired=0
+badged=0
 
 # Idle age comes from the last real conversation turn, NOT the file mtime.
 # Plenty of things append to a session without you touching it — idle
@@ -34,28 +43,24 @@ idle_minutes() {
 		| if . then ((now - (.[0:19] + "Z" | fromdateiso8601)) / 60 | floor) else empty end'
 }
 
+# Minutes since a pid started. macOS `ps` has no `etimes`, and the `date` on
+# this PATH is GNU-style, so parse ps's own [[dd-]hh:]mm:ss by hand. `+0`
+# forces a number: bash arithmetic rejects a zero-padded "08" as octal.
+pid_minutes() {
+	ps -o etime= -p "$1" 2>/dev/null | awk -F'[-:]' '
+		NF == 4 { print $1 * 1440 + $2 * 60 + $3 + 0; next }
+		NF == 3 { print $1 * 60 + $2 + 0; next }
+		NF == 2 { print $1 + 0 }'
+}
+
 while IFS=$'\t' read -r pane sess; do
 	[ -n "$pane" ] || continue
-	[ -f "$sess" ] || continue
-
-	age=$(idle_minutes "$sess")
-	# No parseable turn in the tail — fall back to the file clock.
-	[ -n "$age" ] || age=$(((now - $(stat -f %m "$sess")) / 60))
-	[ "$age" -ge "$IDLE_MIN" ] || continue
-
-	# The conversation is old, but is something still WRITING to the session?
-	# Idle compaction (idleTimeoutSeconds=300) appends without adding a user
-	# turn, so the clock above cannot see it. If the file moved in the last
-	# minute, leave this pane alone and catch it on the next tick — never
-	# SIGTERM omp mid-compaction.
-	if [ $((now - $(stat -f %m "$sess"))) -lt 60 ]; then
-		continue
-	fi
 
 	# An unsent message in the composer. The draft-keeper extension mirrors it
 	# here. Text alone could be restored on wake, but a pasted image cannot —
 	# omp hands extensions a `[Image #1, …]` marker, never the picture — so a
 	# pane that is mid-compose is left awake rather than woken up lossy.
+	# Checked first: a pane can hold a draft before it has a session file.
 	draft="$HOME/.omp/agent/frozen/$pane.draft"
 	if [ -s "$draft" ]; then
 		why="$pane unsent draft ($(stat -f %z "$draft") bytes), left awake"
@@ -64,6 +69,14 @@ while IFS=$'\t' read -r pane sess; do
 		else
 			printf '%s skip %s\n' "$(date +%FT%T)" "$why" >>"$LOG"
 		fi
+		continue
+	fi
+
+	# Is something still WRITING to the session? Idle compaction
+	# (idleTimeoutSeconds=300) appends without adding a user turn, so the turn
+	# clock below cannot see it. If the file moved in the last minute, leave
+	# this pane alone and catch it next tick — never SIGTERM mid-compaction.
+	if [ -f "$sess" ] && [ $((now - $(stat -f %m "$sess"))) -lt 60 ]; then
 		continue
 	fi
 
@@ -85,6 +98,45 @@ while IFS=$'\t' read -r pane sess; do
 	pid=$(printf '%s' "$pinfo" | jq -r '[.result.process_info.foreground_processes[]?
 		| select(.cmdline | test("bin/omp(\\s|$)")) | .pid] | first // empty')
 	[ -n "$pid" ] || continue
+
+	# A session nobody ever typed into — an omp opened in a pane and left at an
+	# empty prompt. Nothing to freeze and nothing to resume, so sleeping it
+	# would park the pane on an empty transcript. Retire it instead: omp dies,
+	# the wrapper finds no session and hands the pane back to its shell. The
+	# clock is omp's own uptime, since there is no turn to measure from, and
+	# the grace is longer than a real conversation gets — a pane sitting at a
+	# fresh prompt is plausibly one you are about to type into.
+	if [ -z "$sess" ] || ! grep -q '"type":"message"' "$sess" 2>/dev/null; then
+		# No session path at all: too little to act on, leave it alone.
+		[ -n "$sess" ] || continue
+		age=$(pid_minutes "$pid")
+		[ -n "$age" ] && [ "$age" -ge "$EMPTY_MIN" ] || continue
+		if [ "${DRY_RUN:-0}" = 1 ]; then
+			printf 'would retire %-8s pid=%-7s up=%sm (no turns)\n' \
+				"$pane" "$pid" "$age"
+			continue
+		fi
+		# Point a wrapped pane at the empty session deliberately: it finds
+		# no file and exits to the shell, rather than falling through to
+		# its last resort — the newest session in this directory, which can
+		# belong to a different pane working in the same repo. A bare pane
+		# has no wrapper to read the hint, and would leave it behind to
+		# confuse the next wrapper started there, so it gets none.
+		if [ "$wrapped" = 1 ]; then
+			mkdir -p "$HOME/.omp/agent/frozen"
+			printf '%s' "$sess" >"$HOME/.omp/agent/frozen/$pane.session"
+		fi
+		kill -TERM "$pid" 2>/dev/null || continue
+		printf '%s retired %s pid=%s up=%sm (no turns) %s\n' \
+			"$(date +%FT%T)" "$pane" "$pid" "$age" "$sess" >>"$LOG"
+		retired=$((retired + 1))
+		continue
+	fi
+
+	age=$(idle_minutes "$sess")
+	# No parseable turn in the tail — fall back to the file clock.
+	[ -n "$age" ] || age=$(((now - $(stat -f %m "$sess")) / 60))
+	[ "$age" -ge "$IDLE_MIN" ] || continue
 
 	if [ "${DRY_RUN:-0}" = 1 ]; then
 		printf 'would sleep %-8s pid=%-7s idle=%sm\n' "$pane" "$pid" "$age"
@@ -145,4 +197,32 @@ done < <(herdr agent list | jq -r '
 	| select(.agent_status == "idle" and .focused == false)
 	| "\(.pane_id)\t\(.agent_session.value // "")"')
 
-[ "${DRY_RUN:-0}" = 1 ] || printf 'slept %s pane(s)\n' "$slept"
+# Panes that are parked but not wearing the badge: their wrapper body predates
+# it (bash froze the body at exec, and a wrapper that never re-execs never
+# grows it), so the pane sleeps while herdr still shows the dead session's
+# green `omp`. Labelling from here fixes those without touching the running
+# wrapper, and cannot mislabel a live pane — a running omp's own herdr hook
+# outranks this source, so the badge only becomes visible once omp is gone.
+badger=$(command -v "$(dirname "$0")/omp-pane" 2>/dev/null || command -v omp-pane 2>/dev/null || true)
+[ "$slept" = 0 ] || sleep 2 # give a pane just killed a moment to reach its pager
+labels=$(herdr agent list | jq -r '.result.agents[]? | "\(.pane_id)\t\(.agent)"')
+while read -r pane; do
+	[ -n "$pane" ] && [ -n "$badger" ] || continue
+	case $(printf '%s' "$labels" | awk -F'\t' -v p="$pane" '$1 == p { print $2 }') in
+	"$BADGE") continue ;;
+	esac
+	herdr pane process-info --pane "$pane" 2>/dev/null |
+		jq -e '.result.process_info.foreground_processes[]?
+			| select(.cmdline | test("omp-frozen"))' >/dev/null 2>&1 || continue
+	if [ "${DRY_RUN:-0}" = 1 ]; then
+		printf 'would badge %s (parked, wrapper too old to label itself)\n' "$pane"
+		continue
+	fi
+	"$badger" --badge "$pane"
+	printf '%s badged %s (parked by a pre-badge wrapper)\n' \
+		"$(date +%FT%T)" "$pane" >>"$LOG"
+	badged=$((badged + 1))
+done < <(herdr pane list | jq -r '.result.panes[]? | .pane_id')
+
+[ "${DRY_RUN:-0}" = 1 ] ||
+	printf 'slept %s, retired %s, badged %s pane(s)\n' "$slept" "$retired" "$badged"

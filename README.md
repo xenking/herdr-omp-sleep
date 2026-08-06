@@ -7,6 +7,7 @@ A live `omp` coding-agent session running in a herdr pane holds roughly 400 MB o
 - Idle panes sleep after N minutes (default 15) and wake on ENTER, resuming the same session file.
 - The frozen view isn't a screenshot: the whole conversation is rendered from the session's `.jsonl`, and omp's own last frame is appended underneath it verbatim, so colors and tool-call cards are exactly what you were looking at. The reaper bakes that frame with `herdr pane read --format ansi` while omp is still alive.
 - The pane stays in herdr's agents sidebar as a dim `omp (sleeping)` row instead of dropping off the list. Live panes keep their normal green state.
+- A session nobody ever typed into is retired to its shell rather than parked — see [Sessions with no conversation](#sessions-with-no-conversation).
 - An unsent message is never lost — see [Unsent messages](#unsent-messages).
 
 ## How it works
@@ -20,7 +21,7 @@ graph LR
     C -->|"ENTER"| A
 ```
 
-**`omp-reap-idle`** runs on a 900-second launchd schedule. It asks herdr for every idle, unfocused pane, works out how long each has really been idle from the session's last conversation turn, and — once a pane clears the threshold and passes every guard below — bakes the pane's current frame with `herdr pane read --format ansi` and sends omp a SIGTERM. For a pane that was never started through the wrapper, it also waits for the shell to come back and types `omp-pane --parked` into it, so sleep behaves the same no matter how the pane began.
+**`omp-reap-idle`** runs on a 900-second launchd schedule. It asks herdr for every idle, unfocused pane, works out how long each has really been idle from the session's last conversation turn, and — once a pane clears the threshold and passes every guard below — bakes the pane's current frame with `herdr pane read --format ansi` and sends omp a SIGTERM. For a pane that was never started through the wrapper, it also waits for the shell to come back and types `omp-pane --parked` into it, so sleep behaves the same no matter how the pane began. Two smaller jobs ride along on the same tick: retiring sessions that have no conversation in them, and labelling parked panes whose wrapper is too old to label itself.
 
 **`omp-pane`** is what herdr templates should run instead of bare `omp`. It runs omp, and when omp exits — your own quit, or the reaper's SIGTERM — it resolves which session just ended (the reaper's hint file first, an explicit `--resume=`, or the newest matching session born after the pane started; if none of that resolves to a real file, it exits to the shell instead of guessing), badges the pane `omp (sleeping)` in herdr's sidebar over the same socket omp's own integration uses, and hands off to `omp-frozen`. When that viewer exits, it un-badges the pane and restarts omp with `--resume=<session>`.
 
@@ -47,6 +48,16 @@ This is the subtle part, so it gets its own section.
 - It refuses to sleep the pane rather than restoring the composer later, because omp only ever hands an extension the composer as text — a pasted image comes back as an `[Image #1, 1024x768]` marker, never the picture. Text is restorable; an attachment provably isn't, so a pane mid-compose stays awake instead of waking up lossy.
 - Plain text drafts are still saved and restored, which covers quitting omp yourself: the next session started in that pane comes back up with the message already in the composer.
 
+## Sessions with no conversation
+
+An `omp` opened in a pane and never typed into has no session file at all — omp writes one on the first turn. There is nothing to freeze and nothing to resume, so parking such a pane would leave it on an empty transcript.
+
+Instead the reaper retires it: SIGTERM, and the pane falls back to its shell, free to be reused or closed. Nothing is lost, because nothing was ever said. The clock is omp's own uptime rather than a conversation turn, and the grace period is `EMPTY_MIN` — four times `IDLE_MIN` by default, since a pane sitting at a fresh prompt is plausibly one you are about to type into. `EMPTY_MIN` is read from the environment; to change it for the scheduled run, add it beside `IDLE_MIN` in the launchd plist.
+
+The draft guard applies here first: a pane with something typed but unsent is left alone even though its session is still empty.
+
+A wrapped pane is handed the empty session's path on the way out, so its wrapper finds no file and exits to the shell instead of falling through to its last resort — the newest session in that directory, which can belong to a different pane working in the same repo. A bare pane has no wrapper to read that hint, so it isn't written; otherwise it would sit in `frozen/` and confuse the next wrapper started in that pane.
+
 ## Requirements
 
 `install.sh` checks the first two before it installs anything:
@@ -67,7 +78,7 @@ cd herdr-omp-sleep
 Options:
 
 - `--prefix DIR` — where the three scripts land. Default `~/.local/bin`.
-- `--idle-min N` — minutes of inactivity before a pane sleeps. Default `15`.
+- `--idle-min N` — minutes of inactivity before a pane sleeps. Default `15`. The reaper also derives `EMPTY_MIN` from it: 4×, the grace given to a session with no conversation.
 - `--herdr-templates` — also rewrite existing herdr pane templates from `command = "omp"` to `command = "omp-pane"`, backing up every file it touches and printing the list.
 - `--uninstall` — remove the scripts, the extension and the launchd agent (see [Uninstall](#uninstall)).
 - `-h`, `--help`
@@ -91,10 +102,10 @@ The only tunable is idle timeout, and the installer keeps two copies of its defa
 See what would happen without touching anything:
 
 ```bash
-DRY_RUN=1 IDLE_MIN=0 omp-reap-idle
+DRY_RUN=1 IDLE_MIN=0 EMPTY_MIN=0 omp-reap-idle
 ```
 
-`IDLE_MIN=0` makes every idle, unfocused pane a candidate no matter how long it's actually been idle; `DRY_RUN=1` prints `would sleep <pane> pid=<pid> idle=<n>m` for each one instead of signaling anything. A pane an unsent draft is holding awake prints its own line too: `skip <pane> unsent draft (<n> bytes), left awake`.
+`IDLE_MIN=0` makes every idle, unfocused pane a candidate no matter how long it's actually been idle, and `EMPTY_MIN=0` does the same for sessions with no conversation; `DRY_RUN=1` prints one line per pane instead of signaling anything: `would sleep <pane> pid=<pid> idle=<n>m`, `would retire <pane> pid=<pid> up=<n>m (no turns)`, `would badge <pane> (parked, wrapper too old to label itself)`, or, for a pane an unsent draft is holding awake, `skip <pane> unsent draft (<n> bytes), left awake`.
 
 See what a real run — scheduled or manual — actually did:
 
@@ -123,6 +134,7 @@ Removes the three scripts from `--prefix`, `draft-keeper.ts` from the extensions
 - macOS only: the reaper is a launchd agent and the scripts shell out to BSD `stat -f`.
 - herdr panes only: the pane wrapper and the draft extension both key off `HERDR_PANE_ID`, which only exists inside a herdr pane.
 - A pane launched from a herdr template whose `command` is still bare `omp` is not wrapped at birth. It still sleeps — the reaper retrofits the wrapper by parking the pane with `omp-pane --parked` after the kill — but that path needs the pane to fall back to a shell first, and logs `WARN … omp still alive, left at shell` if it doesn't. `--herdr-templates` removes the retrofit by wrapping such panes from the start.
+- A wrapper process that started before an upgrade keeps running the old body: bash freezes a script at exec, and this one only re-execs when it parks. A wrapper predating the sidebar badge therefore sleeps its pane without labelling it, and herdr keeps showing the dead session's green `omp`. The reaper labels such panes itself on its next tick, so the wrong colour can persist for up to 15 minutes.
 - A herdr pane id that gets reused by an unrelated new pane can have a stale draft restored into it. It lands visibly in the composer and is deletable, not silently sent anywhere.
 - A draft containing an attachment keeps its pane awake indefinitely, until you send or clear it — there's no timeout on that guard.
 
