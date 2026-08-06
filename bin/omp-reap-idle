@@ -1,0 +1,148 @@
+#!/bin/bash
+# Put idle omp panes to sleep: SIGTERM the agent, leave the pane alive.
+#
+# Panes launched through `omp-pane` catch the exit and park in a frozen,
+# scrollable transcript (~5 MB) instead of dying. ENTER wakes them.
+# A pane launched as bare `omp` just drops back to its shell — the session
+# .jsonl still survives, so nothing is ever lost either way.
+#
+# Only touches agents herdr reports as `idle` and unfocused — never `working`
+# (running now) and never `blocked` (waiting on your answer).
+#
+# Env: IDLE_MIN (default 240), DRY_RUN=1 to only print.
+set -euo pipefail
+
+# Default matches EnvironmentVariables.IDLE_MIN in the launchd plist, so a
+# manual run shows the same panes the scheduled one acts on.
+IDLE_MIN=${IDLE_MIN:-15}
+LOG="$HOME/.local/state/omp-reap.log"
+mkdir -p "$(dirname "$LOG")"
+
+now=$(date +%s)
+slept=0
+
+# Idle age comes from the last real conversation turn, NOT the file mtime.
+# Plenty of things append to a session without you touching it — idle
+# compaction (compaction.idleEnabled, fires at idleTimeoutSeconds=300), the
+# session_exit record omp writes on shutdown, autolearn. Any of those would
+# reset an mtime clock and keep a dead pane awake forever. Measured on a real
+# session: mtime said 33 min idle, the last actual turn was 1214 min ago.
+# jq does the ISO parsing so this never depends on BSD vs GNU `date`.
+idle_minutes() {
+	tail -200 "$1" | jq -rs '
+		[.[] | select(.type == "message") | .timestamp] | last
+		| if . then ((now - (.[0:19] + "Z" | fromdateiso8601)) / 60 | floor) else empty end'
+}
+
+while IFS=$'\t' read -r pane sess; do
+	[ -n "$pane" ] || continue
+	[ -f "$sess" ] || continue
+
+	age=$(idle_minutes "$sess")
+	# No parseable turn in the tail — fall back to the file clock.
+	[ -n "$age" ] || age=$(((now - $(stat -f %m "$sess")) / 60))
+	[ "$age" -ge "$IDLE_MIN" ] || continue
+
+	# The conversation is old, but is something still WRITING to the session?
+	# Idle compaction (idleTimeoutSeconds=300) appends without adding a user
+	# turn, so the clock above cannot see it. If the file moved in the last
+	# minute, leave this pane alone and catch it on the next tick — never
+	# SIGTERM omp mid-compaction.
+	if [ $((now - $(stat -f %m "$sess"))) -lt 60 ]; then
+		continue
+	fi
+
+	# An unsent message in the composer. The draft-keeper extension mirrors it
+	# here. Text alone could be restored on wake, but a pasted image cannot —
+	# omp hands extensions a `[Image #1, …]` marker, never the picture — so a
+	# pane that is mid-compose is left awake rather than woken up lossy.
+	draft="$HOME/.omp/agent/frozen/$pane.draft"
+	if [ -s "$draft" ]; then
+		why="$pane unsent draft ($(stat -f %z "$draft") bytes), left awake"
+		if [ "${DRY_RUN:-0}" = 1 ]; then
+			printf 'skip %s\n' "$why"
+		else
+			printf '%s skip %s\n' "$(date +%FT%T)" "$why" >>"$LOG"
+		fi
+		continue
+	fi
+
+	pinfo=$(herdr pane process-info --pane "$pane" 2>/dev/null)
+
+	# Was this pane launched through the wrapper? If yes it catches the exit
+	# itself. If no — omp IS the pane's command, and killing it drops the pane
+	# to its shell (herdr logs `agent changed … Some(Omp) -> None`; the shell
+	# underneath survives — verified 2026-08-05). We put the wrapper on after
+	# the fact, below, so how a pane was started stops mattering.
+	wrapped=1
+	printf '%s' "$pinfo" | jq -e '.result.process_info.foreground_processes[]?
+		| select(.cmdline | test("omp-pane"))' >/dev/null 2>&1 || wrapped=0
+
+	# Target omp itself, never the wrapper that owns the process group —
+	# killing the wrapper would take the sleep state down with it. `bin/omp`
+	# is anchored so `bin/omp-pane` cannot match. No pgid fallback: if omp
+	# cannot be named exactly, skip the pane rather than guess at a pid.
+	pid=$(printf '%s' "$pinfo" | jq -r '[.result.process_info.foreground_processes[]?
+		| select(.cmdline | test("bin/omp(\\s|$)")) | .pid] | first // empty')
+	[ -n "$pid" ] || continue
+
+	if [ "${DRY_RUN:-0}" = 1 ]; then
+		printf 'would sleep %-8s pid=%-7s idle=%sm\n' "$pane" "$pid" "$age"
+		continue
+	fi
+
+	# Hand the exact session to the omp-pane wrapper. It cannot ask herdr
+	# itself once omp is gone — the agent leaves `agent list` with it.
+	mkdir -p "$HOME/.omp/agent/frozen"
+	printf '%s' "$sess" >"$HOME/.omp/agent/frozen/$pane.session"
+
+	# Bake omp's OWN rendering while it is still alive. herdr already
+	# emulated the terminal, so `--format ansi` hands back the finished grid —
+	# same colours, same tool-call cards, same layout you were looking at.
+	# This is the trick Collie uses to look native without emulating anything
+	# (ARCHITECTURE.md §8 / ADR 0008). Only the rows herdr still holds survive;
+	# omp is on the alternate screen, so deeper history has to come from the
+	# session file instead.
+	# Rows arrive as a terminal grid: padded with spaces to the full pane width
+	# and terminated with CR. Fed to a pager that is exactly as wide, every row
+	# wraps by the padding and you get a blank line after every single line.
+	# Drop the CR and the trailing pad (keeping any reset that follows it).
+	herdr pane read "$pane" --source recent --lines 1000 --format ansi 2>/dev/null \
+		| tr -d '\r' \
+		| sed -E $'s/[[:space:]]+(\033\\[0m)?$/\\1/' \
+		>"$HOME/.omp/agent/frozen/$pane.ans" || true
+
+	# SIGTERM, not SIGKILL: omp flushes a final record to the .jsonl on the way
+	# out, which is what keeps the session resumable.
+	kill -TERM "$pid" 2>/dev/null || continue
+	printf '%s slept %s pid=%s idle=%sm resume=%s\n' \
+		"$(date +%FT%T)" "$pane" "$pid" "$age" "$sess" >>"$LOG"
+	slept=$((slept + 1))
+
+	[ "$wrapped" = 1 ] && continue
+
+	# Bare pane: park it by hand. `herdr pane run` does not spawn a process —
+	# it TYPES the line into the pane's tty. That is only safe once the pane is
+	# back at a shell prompt; typed into a live TUI it lands in that program's
+	# input (2026-08-05: it became a chat message to an agent). So wait for omp
+	# to actually be gone, and bail rather than guess if it lingers.
+	for _ in $(seq 20); do
+		sleep 0.5
+		printf '%s' "$(herdr pane process-info --pane "$pane" 2>/dev/null)" \
+			| jq -e '.result.process_info.foreground_processes[]?
+				| select(.cmdline | test("bin/omp(\\s|$)"))' >/dev/null 2>&1 || break
+	done
+	if herdr pane process-info --pane "$pane" 2>/dev/null \
+		| jq -e '.result.process_info.foreground_processes[]?
+			| select(.cmdline | test("bin/omp(\\s|$)"))' >/dev/null 2>&1; then
+		printf '%s WARN %s omp still alive, left at shell\n' \
+			"$(date +%FT%T)" "$pane" >>"$LOG"
+		continue
+	fi
+	herdr pane run "$pane" omp-pane --parked "--resume=$sess" >/dev/null 2>&1 || true
+done < <(herdr agent list | jq -r '
+	.result.agents[]
+	| select(.agent_status == "idle" and .focused == false)
+	| "\(.pane_id)\t\(.agent_session.value // "")"')
+
+[ "${DRY_RUN:-0}" = 1 ] || printf 'slept %s pane(s)\n' "$slept"

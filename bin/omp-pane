@@ -1,0 +1,134 @@
+#!/bin/bash
+# Whole body is one compound command: bash must read the file to the closing
+# brace before it runs anything. Without this, editing this script while a pane
+# is parked makes bash resume at a stale byte offset when the pager exits and
+# execute the middle of a line as a command — the pane then falls to the shell
+# instead of waking omp. (Seen 2026-08-05.)
+{
+# omp for a herdr pane, with a sleep state.
+#
+# Runs omp. When omp exits — whether you quit it or the idle reaper sent it a
+# SIGTERM — the pane does NOT die: it parks in a frozen, scrollable view of the
+# whole conversation. ENTER wakes omp back into the same session.
+#
+# Measured: less 1.8 MB + this wrapper 2.2 MB, against ~400 MB for a live omp.
+# To actually get rid of the pane, close it in herdr as usual.
+set -uo pipefail
+
+hint_dir="$HOME/.omp/agent/frozen"
+hint="$hint_dir/${HERDR_PANE_ID:-nopane}.session"
+mkdir -p "$hint_dir"
+
+# Keep the pane in herdr's agents sidebar while it sleeps, but dimmed.
+#
+# herdr identifies an agent by the pane's foreground process name, so a pane
+# parked in a pager would drop off the list. Worse, while the exited omp
+# session still owns the pane, herdr skips detection entirely and the row keeps
+# showing a live green `omp`. `pane.report_agent` is the supported way to fix
+# both: it is the same socket call omp's own herdr integration uses.
+#
+# The sequence number is the whole trick. herdr keeps the last seq per
+# (pane, source) and silently DROPS anything not greater, while still answering
+# `ok` - so an undersized seq looks exactly like a working call that does
+# nothing. omp's integration seeds its counter with `Date.now() * 1000`, i.e.
+# microseconds since the epoch, so `date +%s` is six orders of magnitude too
+# small. One second ahead in microseconds beats everything the dead session
+# emitted, and stays behind whatever the next omp process seeds on wake.
+badge_label="omp (sleeping)"
+
+herdr_req() {
+	[ -n "${HERDR_SOCKET_PATH:-}" ] && [ -n "${HERDR_PANE_ID:-}" ] || return 0
+	printf '{"id":"omp-pane","method":"pane.%s","params":{"pane_id":"%s","seq":%s%s}}\n' \
+		"$1" "$HERDR_PANE_ID" "$(( ($(date +%s) + 1) * 1000000 ))" "$2" |
+		nc -U "$HERDR_SOCKET_PATH" >/dev/null 2>&1 || true
+}
+
+# Take the pane over from the session that just exited, then claim it as a
+# dim `unknown` agent: green idle is reserved for a session that can answer.
+badge_sleeping() {
+	herdr_req clear_agent_authority ',"source":"herdr:omp"'
+	herdr_req report_agent ",\"source\":\"omp-pane\",\"agent\":\"$badge_label\",\"state\":\"unknown\""
+}
+
+# Hand the pane back before omp starts, so its own integration owns it again.
+badge_awake() {
+	herdr_req release_agent ",\"source\":\"omp-pane\",\"agent\":\"$badge_label\""
+}
+
+# Session this pane is on. Never guesses: a wrong resume is worse than no sleep.
+resolve_session() {
+	local started=$1 hash bucket cand
+
+	# 1. The reaper read it straight off herdr just before it put us to sleep.
+	if [ -s "$hint" ]; then
+		cat "$hint"
+		return
+	fi
+
+	# 2. We were launched against an explicit session.
+	for a in "$@"; do
+		case $a in
+		--resume=*) printf '%s' "${a#--resume=}"; return ;;
+		esac
+	done
+
+	# 3. A session this pane created after it started. Bucket name is
+	#    <prefix>-<name>-<sha256 of the absolute cwd>, verified against the
+	#    live store. Birth time — not mtime — so a sibling pane working in the
+	#    same directory can never be mistaken for ours.
+	hash=$(printf '%s' "$PWD" | shasum -a256 | cut -d' ' -f1)
+	bucket=$(find "$HOME/.omp/agent/sessions" -maxdepth 1 -type d -name "*-$hash" | head -1)
+	[ -n "$bucket" ] || return 0
+
+	cand=$(find "$bucket" -maxdepth 1 -name '*.jsonl' \
+		-exec stat -f '%B %N' {} + 2>/dev/null |
+		awk -v t="$started" '$1 >= t' | sort -rn | head -1 | cut -d' ' -f2-)
+	printf '%s' "$cand"
+}
+
+started=$(date +%s)
+
+# `--parked`: come up already asleep. The reaper uses this to retrofit a sleep
+# state onto a pane that was launched as bare `omp` — it kills omp, waits for
+# the shell, then starts us here. Everything after the first freeze is the
+# ordinary loop, so such a pane is indistinguishable from one wrapped at birth.
+parked=0
+if [ "${1:-}" = --parked ]; then
+	parked=1
+	shift
+fi
+
+[ "$parked" = 1 ] || omp "$@"
+
+while :; do
+	sess=$(resolve_session "$started" "$@")
+	rm -f "$hint"
+
+	# Could not identify our session — behave like plain omp and hand the pane
+	# back to the shell rather than resuming somebody else's conversation.
+	[ -n "$sess" ] && [ -f "$sess" ] || exit 0
+
+	if [ "$parked" != 1 ]; then
+		# Re-exec once per sleep so a wrapper that has been running for days
+		# picks up edits to this script instead of carrying a stale body
+		# forever (the brace above makes bash read the whole file at start,
+		# which is what keeps a live edit safe — and also what freezes the
+		# body for this process). `--parked` lands straight below.
+		#
+		# $0 is the bare word when herdr spawns us from a template
+		# (`command = "omp-pane"`), an absolute path when a shell resolved it:
+		# `command -v` covers both, and skipping the exec is harmless.
+		self=$(command -v "$0" 2>/dev/null || true)
+		[ -n "$self" ] && exec "$self" --parked "--resume=$sess"
+	fi
+	parked=0
+
+	badge_sleeping
+	omp-frozen "$sess" || { badge_awake; exit 0; }
+	badge_awake
+
+	started=$(date +%s)
+	set -- "--resume=$sess"
+	omp "$@"
+done
+}

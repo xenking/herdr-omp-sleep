@@ -1,0 +1,89 @@
+#!/bin/bash
+# Read fully before executing — see the note in omp-pane. This file is edited
+# while panes are parked inside it; without the brace, bash resumes at a stale
+# offset and runs its own source as commands.
+{
+# Frozen view of an omp session: the whole conversation, scrollable, ~5 MB RSS.
+# Press ENTER to wake the session back into omp. Renders from the session
+# .jsonl, not from terminal scrollback — omp draws on the alternate screen, so
+# herdr's host scrollback only ever holds the last screenful.
+#
+# Usage: omp-frozen <session.jsonl>
+set -euo pipefail
+
+sess=${1:?usage: omp-frozen <session.jsonl>}
+[ -f "$sess" ] || { echo "no such session: $sess" >&2; exit 2; }
+
+cache_dir="$HOME/.omp/agent/frozen"
+mkdir -p "$cache_dir"
+view="$cache_dir/$(basename "${sess%.jsonl}").txt"
+
+# ponytail: rebuild only when the session outgrew its render. Cheap enough
+# (~0.4s for a 7 MB session) that no finer invalidation is worth it.
+if [ ! -f "$view" ] || [ "$sess" -nt "$view" ]; then
+	jq -r '
+	  def dim(s): "\u001b[2m" + s + "\u001b[0m";
+	  def trunc(s; n):
+	    (s | split("\n") | map("    " + .)) as $l
+	    | if ($l | length) > n
+	      then (($l[0:n] | join("\n")) + "\n" + dim("      … " + (($l | length) - n | tostring) + " more lines"))
+	      else ($l | join("\n")) end;
+
+	  select(.type == "message")
+	  | .message as $m
+	  | if $m.role == "user" then
+	      "\n\u001b[1;35m▌ YOU\u001b[0m\n"
+	      + ($m.content | if type == "array" then (map(select(.type == "text").text) | join("\n")) else tostring end)
+	    elif $m.role == "assistant" then
+	      ($m.content // [] | map(
+	         if .type == "text" then "\n" + .text
+	         elif .type == "thinking" then dim("  · thinking ·")
+	         elif .type == "toolCall" then
+	           "\u001b[36m  → " + (.name // "tool") + "\u001b[0m"
+	           + (if .intent then dim("  " + .intent) else "" end)
+	         else empty end) | join("\n"))
+	    elif $m.role == "toolResult" then
+	      ($m.content // [] | map(select(.type == "text").text) | join("\n")) as $t
+	      | if ($t | length) == 0 then empty
+	        else trunc($t; 3) end
+	    else empty end
+	' "$sess" >"$view"
+fi
+
+# The pane's last rendered frame, baked by the reaper while omp was still up.
+# It is omp's own output, so colours and tool-call cards are exact; only the
+# rows above it are our reconstruction from the session file.
+baked="$cache_dir/${HERDR_PANE_ID:-nopane}.ans"
+combined=$(mktemp)
+trap 'rm -f "$combined" "$keys"' EXIT
+
+# `less -R` cannot measure the display width of true-colour escapes, so a
+# full-width row (omp draws a right border at the last column) is counted as
+# too long and wrapped — that is the blank line after every single line. `-S`
+# stops the pager wrapping at all; the reconstructed history is folded here
+# instead, where the text is plain and the width is known.
+cols=$(tput cols 2>/dev/null || echo 200)
+LC_ALL=${LC_ALL:-en_US.UTF-8} fold -s -w "$cols" <"$view" >"$combined"
+if [ -s "$baked" ]; then
+	printf '\n\033[2m%s native frame below — omp'"'"'s own rendering %s\033[0m\n\n' \
+		'────────' '────────' >>"$combined"
+	cat "$baked" >>"$combined"
+fi
+
+keys=$(mktemp)
+printf '#command\n\\r quit\n\\n quit\n' >"$keys"
+
+rows=$(wc -l <"$combined" | tr -d ' ')
+
+# Nerd Font icons (powerline separators, the model/branch glyphs in omp's
+# status line) live in the Unicode Private Use Area, which less treats as
+# unprintable and escapes to <U+F090>. Declare the three PUA blocks printable —
+# the exact incantation from less(1).
+export LESSUTFCHARDEF="E000-F8FF:p,F0000-FFFFD:p,100000-10FFFD:p"
+# +G opens at the bottom, on the native frame: the pane looks like you left it.
+less -R -S +G --lesskey-src="$keys" \
+	-P "SLEEPING  ${rows} lines  ·  ↑↓ PgUp/PgDn scroll back  ·  ENTER wake omp  ?ltline %lt/${rows}." \
+	"$combined"
+}
+
+
