@@ -4,8 +4,9 @@
 # offset and runs its own source as commands.
 {
 # Frozen view of an omp session: the whole conversation, scrollable, ~5 MB RSS.
-# Press ENTER to wake the session back into omp. Renders from the session
-# .jsonl, not from terminal scrollback — omp draws on the alternate screen, so
+# Press ENTER to wake the session back into omp, or q/Ctrl-C to leave it at
+# the shell.
+# Renders from the session .jsonl, not from terminal scrollback — omp draws on
 # herdr's host scrollback only ever holds the last screenful.
 #
 # Usage: omp-frozen <session.jsonl>
@@ -71,8 +72,7 @@ if [ -s "$baked" ]; then
 fi
 
 keys=$(mktemp)
-printf '#command\n\\r quit\n\\n quit\n' >"$keys"
-
+printf '#command\n\\r quit\n\\n quit\nq quit 1\nQ quit 1\n^C quit 1\n' >"$keys"
 rows=$(wc -l <"$combined" | tr -d ' ')
 
 # Nerd Font icons (powerline separators, the model/branch glyphs in omp's
@@ -81,8 +81,8 @@ rows=$(wc -l <"$combined" | tr -d ' ')
 # the exact incantation from less(1).
 export LESSUTFCHARDEF="E000-F8FF:p,F0000-FFFFD:p,100000-10FFFD:p"
 # +G opens at the bottom, on the native frame: the pane looks like you left it.
-less -R -S +G --lesskey-src="$keys" \
-	-P "SLEEPING  ${rows} lines  ·  ↑↓ PgUp/PgDn scroll back  ·  ENTER wake omp  ?ltline %lt/${rows}." \
+less -R -S -K +G --lesskey-src="$keys" \
+	-P "SLEEPING  ${rows} lines  ·  ↑↓ PgUp/PgDn scroll  ·  ENTER wake  ·  q close  ?ltline %lt/${rows}." \
 	"$combined"
 }
 

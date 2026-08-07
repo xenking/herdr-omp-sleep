@@ -101,9 +101,9 @@ while IFS=$'\t' read -r pane sess; do
 
 	# A session nobody ever typed into — an omp opened in a pane and left at an
 	# empty prompt. Nothing to freeze and nothing to resume, so sleeping it
-	# would park the pane on an empty transcript. Retire it instead: omp dies,
-	# the wrapper finds no session and hands the pane back to its shell. The
-	# clock is omp's own uptime, since there is no turn to measure from, and
+	# would park the pane on an empty transcript. Retire it instead: omp dies
+	# and the wrapper hands the pane back to its shell. The clock is omp's own
+	# uptime, since there is no turn to measure from, and
 	# the grace is longer than a real conversation gets — a pane sitting at a
 	# fresh prompt is plausibly one you are about to type into.
 	if [ -z "$sess" ] || ! grep -q '"type":"message"' "$sess" 2>/dev/null; then
@@ -116,15 +116,16 @@ while IFS=$'\t' read -r pane sess; do
 				"$pane" "$pid" "$age"
 			continue
 		fi
-		# Point a wrapped pane at the empty session deliberately: it finds
-		# no file and exits to the shell, rather than falling through to
-		# its last resort — the newest session in this directory, which can
-		# belong to a different pane working in the same repo. A bare pane
-		# has no wrapper to read the hint, and would leave it behind to
-		# confuse the next wrapper started there, so it gets none.
+		# Tell a wrapped pane not to park: an empty hint means "the session
+		# you were on is not worth resuming, go back to the shell". Without
+		# it the wrapper would fall through to its last resort — the newest
+		# session in this directory, which can belong to a different pane
+		# working in the same repo. A bare pane has no wrapper to read the
+		# hint and would leave it behind to confuse the next wrapper started
+		# there, so it gets none.
 		if [ "$wrapped" = 1 ]; then
 			mkdir -p "$HOME/.omp/agent/frozen"
-			printf '%s' "$sess" >"$HOME/.omp/agent/frozen/$pane.session"
+			: >"$HOME/.omp/agent/frozen/$pane.session"
 		fi
 		kill -TERM "$pid" 2>/dev/null || continue
 		printf '%s retired %s pid=%s up=%sm (no turns) %s\n' \

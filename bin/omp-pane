@@ -103,6 +103,16 @@ resolve_session() {
 }
 
 started=$(date +%s)
+# Only the reaper parks this pane. It writes the session path into the hint
+# file immediately before it signals omp, so a non-empty hint is the one thing
+# that means "park". No hint at all is a quit you asked for — Ctrl-C, `/exit`,
+# a crash — and an empty hint is the reaper retiring a session with nothing in
+# it. Both of those hand the pane back to its shell. Exit codes cannot tell
+# them apart: omp leaves on 0 either way.
+run_omp() {
+	omp "$@"
+	[ -s "$hint" ] || { rm -f "$hint"; exit 0; }
+}
 
 # `--parked`: come up already asleep. The reaper uses this to retrofit a sleep
 # state onto a pane that was launched as bare `omp` — it kills omp, waits for
@@ -114,7 +124,7 @@ if [ "${1:-}" = --parked ]; then
 	shift
 fi
 
-[ "$parked" = 1 ] || omp "$@"
+[ "$parked" = 1 ] || run_omp "$@"
 
 while :; do
 	sess=$(resolve_session "$started" "$@")
@@ -145,6 +155,6 @@ while :; do
 
 	started=$(date +%s)
 	set -- "--resume=$sess"
-	omp "$@"
+	run_omp "$@"
 done
 }

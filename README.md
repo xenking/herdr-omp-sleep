@@ -1,10 +1,10 @@
 # herdr-omp-sleep
 
-A live `omp` coding-agent session running in a herdr pane holds roughly 400 MB of RSS. Open a dozen panes across a few projects and the machine is out of memory — but closing them loses your place in every conversation. herdr-omp-sleep parks an idle session instead: once a pane has been quiet long enough, the omp process is stopped, the pane keeps living as a frozen, scrollable view of the whole conversation, and pressing ENTER brings the session back exactly where it was. A sleeping pane measures about 4 MB — 1.8 MB for `less`, 2.2 MB for the wrapper watching it — instead of ~400 MB for a live one; on the development machine, six sleeping panes together used 9.9 MB.
+A live `omp` coding-agent session running in a herdr pane holds roughly 400 MB of RSS. Open a dozen panes across a few projects and the machine is out of memory — but closing them loses your place in every conversation. herdr-omp-sleep parks an *idle* session instead: once a pane has been quiet long enough, the omp process is stopped, the pane keeps living as a frozen, scrollable view of the whole conversation, and pressing ENTER brings the session back exactly where it was. Quitting omp yourself still just quits — sleep is something the idle reaper does to you, never something your own Ctrl-C triggers. A sleeping pane measures about 4 MB — 1.8 MB for `less`, 2.2 MB for the wrapper watching it — instead of ~400 MB for a live one; on the development machine, six sleeping panes together used 9.9 MB.
 
 ## What you get
 
-- Idle panes sleep after N minutes (default 15) and wake on ENTER, resuming the same session file.
+- Idle panes sleep after N minutes (default 15), ENTER wakes them back into the same session, and q/Ctrl-C leaves a sleeping pane at its shell.
 - The frozen view isn't a screenshot: the whole conversation is rendered from the session's `.jsonl`, and omp's own last frame is appended underneath it verbatim, so colors and tool-call cards are exactly what you were looking at. The reaper bakes that frame with `herdr pane read --format ansi` while omp is still alive.
 - The pane stays in herdr's agents sidebar as a dim `omp (sleeping)` row instead of dropping off the list. Live panes keep their normal green state.
 - A session nobody ever typed into is retired to its shell rather than parked — see [Sessions with no conversation](#sessions-with-no-conversation).
@@ -19,13 +19,14 @@ graph LR
     A["Live omp"] --> B["omp-reap-idle: SIGTERM"]
     B --> C["Frozen view"]
     C -->|"ENTER"| A
+    C -->|"q / Ctrl-C"| D["Shell"]
 ```
 
 **`omp-reap-idle`** runs on a 900-second launchd schedule. It asks herdr for every idle, unfocused pane, works out how long each has really been idle from the session's last conversation turn, and — once a pane clears the threshold and passes every guard below — bakes the pane's current frame with `herdr pane read --format ansi` and sends omp a SIGTERM. For a pane that was never started through the wrapper, it also waits for the shell to come back and types `omp-pane --parked` into it, so sleep behaves the same no matter how the pane began. Two smaller jobs ride along on the same tick: retiring sessions that have no conversation in them, and labelling parked panes whose wrapper is too old to label itself.
 
-**`omp-pane`** is what herdr templates should run instead of bare `omp`. It runs omp, and when omp exits — your own quit, or the reaper's SIGTERM — it resolves which session just ended (the reaper's hint file first, an explicit `--resume=`, or the newest matching session born after the pane started; if none of that resolves to a real file, it exits to the shell instead of guessing), badges the pane `omp (sleeping)` in herdr's sidebar over the same socket omp's own integration uses, and hands off to `omp-frozen`. When that viewer exits, it un-badges the pane and restarts omp with `--resume=<session>`.
+**`omp-pane`** is what herdr templates should run instead of bare `omp`. It runs omp, and when omp exits because the reaper sent SIGTERM, it resolves which session just ended (the reaper's hint file first, an explicit `--resume=`, or the newest matching session born after the pane started; if none of that resolves to a real file, it exits to the shell instead of guessing), badges the pane `omp (sleeping)` in herdr's sidebar over the same socket omp's own integration uses, and hands off to `omp-frozen`. User Ctrl-C is treated as an explicit close and exits to the shell instead of parking.
 
-**`omp-frozen`** renders the whole conversation from the session's `.jsonl` — user turns, assistant text and tool calls, truncated tool output — into a cached, colored text view, then appends the exact frame the reaper baked while omp was still running, so the bottom of the screen is exactly what you left. It opens the result in `less`, scrolled to the bottom, with ENTER wired to quit and hand control back to `omp-pane`.
+**`omp-frozen`** renders the whole conversation from the session's `.jsonl` — user turns, assistant text and tool calls, truncated tool output — into a cached, colored text view, then appends the exact frame the reaper baked while omp was still running, so the bottom of the screen is exactly what you left. It opens the result in `less`, scrolled to the bottom, with ENTER wired to wake and q/Ctrl-C wired to exit to the shell.
 
 **`draft-keeper.ts`** is an omp extension that mirrors the composer's text to `~/.omp/agent/frozen/<pane>.draft` every 5 seconds and once more on shutdown, and restores it into an empty composer on the next session start. Its only other reader is the reaper, which treats a non-empty draft file as a reason not to sleep the pane.
 
@@ -46,7 +47,7 @@ This is the subtle part, so it gets its own section.
 - `draft-keeper.ts` mirrors the composer into `~/.omp/agent/frozen/<pane>.draft` every 5 seconds, and once more on shutdown.
 - `omp-reap-idle` checks that file before doing anything else to the pane; if it's non-empty, it skips the pane and logs why instead of sleeping it.
 - It refuses to sleep the pane rather than restoring the composer later, because omp only ever hands an extension the composer as text — a pasted image comes back as an `[Image #1, 1024x768]` marker, never the picture. Text is restorable; an attachment provably isn't, so a pane mid-compose stays awake instead of waking up lossy.
-- Plain text drafts are still saved and restored, which covers quitting omp yourself: the next session started in that pane comes back up with the message already in the composer.
+- Plain text drafts are still saved and restored: the next session started in that pane comes back up with the message already in the composer.
 
 ## Sessions with no conversation
 
@@ -56,7 +57,7 @@ Instead the reaper retires it: SIGTERM, and the pane falls back to its shell, fr
 
 The draft guard applies here first: a pane with something typed but unsent is left alone even though its session is still empty.
 
-A wrapped pane is handed the empty session's path on the way out, so its wrapper finds no file and exits to the shell instead of falling through to its last resort — the newest session in that directory, which can belong to a different pane working in the same repo. A bare pane has no wrapper to read that hint, so it isn't written; otherwise it would sit in `frozen/` and confuse the next wrapper started in that pane.
+A wrapped pane is handed an *empty* hint file on the way out. That is the wrapper's signal to skip the pager and exit to the shell, and it also stops the wrapper falling through to its last resort — the newest session in that directory, which can belong to a different pane working in the same repo. A bare pane has no wrapper to read that hint, so it isn't written; otherwise it would sit in `frozen/` and confuse the next wrapper started in that pane.
 
 ## Requirements
 
@@ -135,6 +136,7 @@ Removes the three scripts from `--prefix`, `draft-keeper.ts` from the extensions
 - herdr panes only: the pane wrapper and the draft extension both key off `HERDR_PANE_ID`, which only exists inside a herdr pane.
 - A pane launched from a herdr template whose `command` is still bare `omp` is not wrapped at birth. It still sleeps — the reaper retrofits the wrapper by parking the pane with `omp-pane --parked` after the kill — but that path needs the pane to fall back to a shell first, and logs `WARN … omp still alive, left at shell` if it doesn't. `--herdr-templates` removes the retrofit by wrapping such panes from the start.
 - A wrapper process that started before an upgrade keeps running the old body: bash freezes a script at exec, and this one only re-execs when it parks. A wrapper predating the sidebar badge therefore sleeps its pane without labelling it, and herdr keeps showing the dead session's green `omp`. The reaper labels such panes itself on its next tick, so the wrong colour can persist for up to 15 minutes.
+- A wrapper old enough to predate this behaviour also parks on *your* quit, not just the reaper's: quitting omp in such a pane drops you into the frozen view, and one `q` from there gets you the shell. It re-execs itself on its next sleep and behaves from then on.
 - A herdr pane id that gets reused by an unrelated new pane can have a stale draft restored into it. It lands visibly in the composer and is deletable, not silently sent anywhere.
 - A draft containing an attachment keeps its pane awake indefinitely, until you send or clear it — there's no timeout on that guard.
 
