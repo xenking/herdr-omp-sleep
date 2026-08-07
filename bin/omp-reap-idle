@@ -6,19 +6,27 @@
 # A pane launched as bare `omp` just drops back to its shell — the session
 # .jsonl still survives, so nothing is ever lost either way.
 #
-# Only touches agents herdr reports as `idle` and unfocused — never `working`
-# (running now) and never `blocked` (waiting on your answer).
+# Never touches a pane that is running a turn or waiting on your answer: the
+# agent row says so, and a live omp spins a braille marker in the terminal
+# title, which is checked too because that row can freeze (see the selector).
 #
 # Env: IDLE_MIN (default 15) — minutes a conversation must be untouched.
 #      EMPTY_MIN (default 4x IDLE_MIN) — omp uptime before a pane whose session
-#      has no turns at all is retired to its shell.
+#      has no turns at all is retired to its shell. Also the grace for a pane
+#      herdr still calls focused.
 #      DRY_RUN=1 to only print.
+# Args: --pane <id> — consider only that pane. A bare run sweeps every pane,
+#      which is right for the schedule and wrong for a test: verifying one
+#      fixture put a real work pane to sleep as a side effect (2026-08-07).
 set -euo pipefail
 
 # Default matches EnvironmentVariables.IDLE_MIN in the launchd plist, so a
 # manual run shows the same panes the scheduled one acts on.
 IDLE_MIN=${IDLE_MIN:-15}
 EMPTY_MIN=${EMPTY_MIN:-$((IDLE_MIN * 4))}
+
+ONLY=""
+[ "${1:-}" = --pane ] && ONLY=${2:?usage: omp-reap-idle [--pane <id>]}
 
 # Must match badge_label in omp-pane.
 BADGE="omp (sleeping)"
@@ -53,8 +61,9 @@ pid_minutes() {
 		NF == 2 { print $1 + 0 }'
 }
 
-while IFS=$'\t' read -r pane sess; do
+while IFS=$'\t' read -r pane sess focused; do
 	[ -n "$pane" ] || continue
+	[ -z "$ONLY" ] || [ "$pane" = "$ONLY" ] || continue
 
 	# An unsent message in the composer. The draft-keeper extension mirrors it
 	# here. Text alone could be restored on wake, but a pasted image cannot —
@@ -72,6 +81,38 @@ while IFS=$'\t' read -r pane sess; do
 		continue
 	fi
 
+	pinfo=$(herdr pane process-info --pane "$pane" 2>/dev/null)
+
+	# The session path herdr reports is not proof, and checking that the file
+	# exists is not enough to make it proof. Any omp started inside the pane
+	# loads the same herdr integration, inherits HERDR_PANE_ID, and reports
+	# ITS session as the pane's: a session testing account isolation spawned
+	# throwaway agents under `/tmp/acct-iso`, and the row followed each one
+	# (2026-08-07). Those files exist, so they read as perfectly good
+	# sessions — while the 17 MB conversation the pane is really on goes
+	# unmeasured, and sleeping the pane would bake the wrong resume path.
+	#
+	# The pane's own processes cannot be hijacked that way, so ask them
+	# first: the wrapper carries the session it parked on, and an omp
+	# resumed by hand carries it on its command line. herdr's answer is the
+	# last resort, for a pane on a first-run session nobody has resumed.
+	# Whatever the source, a path that resolves to no file is UNKNOWN, and
+	# must stay unknown all the way down — the empty-session branch below
+	# kills omp, and a real conversation must never look to it like a pane
+	# sitting at a fresh prompt.
+	for candidate in \
+		"$(printf '%s' "$pinfo" | jq -r '[.result.process_info.foreground_processes[]?
+			| select(.cmdline | test("omp-pane"))
+			| .cmdline | capture("--resume=(?<s>\\S+)").s] | first // empty')" \
+		"$(printf '%s' "$pinfo" | jq -r '[.result.process_info.foreground_processes[]?
+			| select(.cmdline | test("bin/omp(\\s|$)"))
+			| .cmdline | capture("--resume=(?<s>\\S+)").s] | first // empty')" \
+		"$sess"; do
+		[ -f "$candidate" ] && break
+		candidate=""
+	done
+	sess=$candidate
+
 	# Is something still WRITING to the session? Idle compaction
 	# (idleTimeoutSeconds=300) appends without adding a user turn, so the turn
 	# clock below cannot see it. If the file moved in the last minute, leave
@@ -79,8 +120,6 @@ while IFS=$'\t' read -r pane sess; do
 	if [ -f "$sess" ] && [ $((now - $(stat -f %m "$sess"))) -lt 60 ]; then
 		continue
 	fi
-
-	pinfo=$(herdr pane process-info --pane "$pane" 2>/dev/null)
 
 	# Was this pane launched through the wrapper? If yes it catches the exit
 	# itself. If no — omp IS the pane's command, and killing it drops the pane
@@ -137,7 +176,14 @@ while IFS=$'\t' read -r pane sess; do
 	age=$(idle_minutes "$sess")
 	# No parseable turn in the tail — fall back to the file clock.
 	[ -n "$age" ] || age=$(((now - $(stat -f %m "$sess")) / 60))
-	[ "$age" -ge "$IDLE_MIN" ] || continue
+	# herdr only learns about focus from its own tab.focus events, so a pane
+	# keeps the flag while you work in another window: wC:p1 still claimed
+	# focus 2.5 h after the last event (2026-08-07). Honour it, but not
+	# forever — a pane you have not typed into for EMPTY_MIN is not one you
+	# are looking at, whatever the flag says.
+	min=$IDLE_MIN
+	[ "$focused" = true ] && min=$EMPTY_MIN
+	[ "$age" -ge "$min" ] || continue
 
 	if [ "${DRY_RUN:-0}" = 1 ]; then
 		printf 'would sleep %-8s pid=%-7s idle=%sm\n' "$pane" "$pid" "$age"
@@ -193,10 +239,21 @@ while IFS=$'\t' read -r pane sess; do
 		continue
 	fi
 	herdr pane run "$pane" omp-pane --parked "--resume=$sess" >/dev/null 2>&1 || true
-done < <(herdr agent list | jq -r '
-	.result.agents[]
-	| select(.agent_status == "idle" and .focused == false)
-	| "\(.pane_id)\t\(.agent_session.value // "")"')
+done < <(herdr agent list | jq -r --argjson p "$(herdr pane list)" '
+	# `working`/`blocked` in the row is the first-choice "leave it alone", but
+	# the row can freeze: a nested session that reports and exits leaves the
+	# pane stuck on its last state (wC:p1 sat on `done` for hours while omp
+	# ran turns underneath, 2026-08-07). Since the status filter alone can no
+	# longer be trusted to notice a live turn, second-guess it with something
+	# the pane writes itself — omp puts a braille spinner in the terminal
+	# title while a turn is running and `>` when it is waiting for you.
+	($p.result.panes // []) as $panes
+	| .result.agents[]
+	| select(.agent_status == "working" or .agent_status == "blocked" | not)
+	| . as $a
+	| ($panes[] | select(.pane_id == $a.pane_id) | .terminal_title // "") as $title
+	| select($title | test("[\u2800-\u28ff]") | not)
+	| "\($a.pane_id)\t\($a.agent_session.value // "")\t\($a.focused)"')
 
 # Panes that are parked but not wearing the badge: their wrapper body predates
 # it (bash froze the body at exec, and a wrapper that never re-execs never
@@ -209,6 +266,7 @@ badger=$(command -v "$(dirname "$0")/omp-pane" 2>/dev/null || command -v omp-pan
 labels=$(herdr agent list | jq -r '.result.agents[]? | "\(.pane_id)\t\(.agent)"')
 while read -r pane; do
 	[ -n "$pane" ] && [ -n "$badger" ] || continue
+	[ -z "$ONLY" ] || [ "$pane" = "$ONLY" ] || continue
 	case $(printf '%s' "$labels" | awk -F'\t' -v p="$pane" '$1 == p { print $2 }') in
 	"$BADGE") continue ;;
 	esac

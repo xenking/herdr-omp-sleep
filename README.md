@@ -34,7 +34,10 @@ graph LR
 
 This is the trust section: every line below is a guard that actually exists in `omp-reap-idle`, not an aspiration.
 
-- Only touches a pane herdr reports as `idle` and unfocused — never one that's `working` (a turn is running) or `blocked` (waiting on your answer).
+- Never touches a pane that is running a turn or waiting on your answer. herdr's agent row says which, but the row is not trusted on its own: it can freeze (see [Limits](#limits)), so a pane is also skipped whenever its terminal title carries omp's braille spinner — the marker the pane itself writes while a turn runs, and drops for `>` when it's your move.
+- Never trusts herdr's answer to "which session is this pane on". Every omp started inside a pane — a nested experiment, an agent in a scratch directory — inherits `HERDR_PANE_ID` and reports its own session as the pane's. The reaper asks the pane's own processes first (the wrapper's `--resume=`, then omp's), and falls back to herdr only for a first-run session nobody has resumed.
+- A session path that resolves to no file is treated as *unknown*, never as *empty*. The empty-session branch kills omp, so this distinction is what stops a stale row turning a 17 MB conversation into a "pane at a fresh prompt".
+- A pane herdr still calls focused gets the longer `EMPTY_MIN` grace instead of an exemption: herdr only learns about focus from its own tab events, so the flag survives you moving to another window, and an hour without a turn settles the question.
 - Idle age comes from the last real conversation turn in the session file, never the file's mtime. Idle compaction, autolearn, and the shutdown record all touch a session without you being there; on a real session, mtime claimed 33 minutes idle while the last actual turn was 1214 minutes old.
 - If the session file was written in the last 60 seconds, the pane is left alone — never SIGTERM omp mid-compaction.
 - SIGTERM, never SIGKILL: omp flushes a final record on the way out, which is what keeps the session resumable.
@@ -108,6 +111,12 @@ DRY_RUN=1 IDLE_MIN=0 EMPTY_MIN=0 omp-reap-idle
 
 `IDLE_MIN=0` makes every idle, unfocused pane a candidate no matter how long it's actually been idle, and `EMPTY_MIN=0` does the same for sessions with no conversation; `DRY_RUN=1` prints one line per pane instead of signaling anything: `would sleep <pane> pid=<pid> idle=<n>m`, `would retire <pane> pid=<pid> up=<n>m (no turns)`, `would badge <pane> (parked, wrapper too old to label itself)`, or, for a pane an unsent draft is holding awake, `skip <pane> unsent draft (<n> bytes), left awake`.
 
+A bare run sweeps every pane, which is what the schedule wants and the wrong thing for an experiment — verifying one throwaway fixture at `IDLE_MIN=0` also put a real work pane to sleep. Scope it:
+
+```bash
+omp-reap-idle --pane wD:p3
+```
+
 See what a real run — scheduled or manual — actually did:
 
 ```bash
@@ -139,6 +148,7 @@ Removes the three scripts from `--prefix`, `draft-keeper.ts` from the extensions
 - A wrapper old enough to predate this behaviour also parks on *your* quit, not just the reaper's: quitting omp in such a pane drops you into the frozen view, and one `q` from there gets you the shell. It re-execs itself on its next sleep and behaves from then on.
 - A herdr pane id that gets reused by an unrelated new pane can have a stale draft restored into it. It lands visibly in the composer and is deletable, not silently sent anywhere.
 - A draft containing an attachment keeps its pane awake indefinitely, until you send or clear it — there's no timeout on that guard.
+- herdr's agent row for a pane can stop tracking that pane. Every omp started inside it reports through the same integration, so a nested session takes the row over, and when that one exits the row keeps its last state: a pane sat on a grey `done` for hours, its `state_change_seq` frozen, while the real omp ran turns underneath. Nothing outside can repair it — herdr accepts `pane.clear_agent_authority` and `pane.report_agent_session` from an official source with `ok` and applies neither. The next omp *start* in that pane fixes it, which sleeping and waking the pane does for you. The guards above are written so that a lying row costs you a delayed sleep, never a killed session.
 
 ## License
 
