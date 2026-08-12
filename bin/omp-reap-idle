@@ -176,6 +176,16 @@ while IFS=$'\t' read -r pane sess focused; do
 	age=$(idle_minutes "$sess")
 	# No parseable turn in the tail — fall back to the file clock.
 	[ -n "$age" ] || age=$(((now - $(stat -f %m "$sess")) / 60))
+	# The turn clock measures the CONVERSATION, not the human. Reading a woken
+	# pane — paging the session tree, scrolling back — writes no turn, so a
+	# session resumed after a night away reads as `idle=1107m` and goes
+	# straight back to sleep while you are looking at it (2026-08-12). omp's
+	# own uptime is the floor: however old the last turn is, this omp has only
+	# been in front of you since it started, so ENTER buys a full IDLE_MIN.
+	# ponytail: no screen-diff signal — an idle omp's grid still changes every
+	# tick (burn-rate cell), so hashing it would sleep nothing, ever.
+	up=$(pid_minutes "$pid")
+	if [ -n "$up" ] && [ "$up" -lt "$age" ]; then age=$up; fi
 	# herdr only learns about focus from its own tab.focus events, so a pane
 	# keeps the flag while you work in another window: wC:p1 still claimed
 	# focus 2.5 h after the last event (2026-08-07). Honour it, but not

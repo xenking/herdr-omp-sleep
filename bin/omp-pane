@@ -73,7 +73,7 @@ fi
 
 # Session this pane is on. Never guesses: a wrong resume is worse than no sleep.
 resolve_session() {
-	local started=$1 hash bucket cand
+	local started=$1 hash bucket cand cwd home
 
 	# 1. The reaper read it straight off herdr just before it put us to sleep.
 	if [ -s "$hint" ]; then
@@ -88,13 +88,26 @@ resolve_session() {
 		esac
 	done
 
-	# 3. A session this pane created after it started. Bucket name is
-	#    <prefix>-<name>-<sha256 of the absolute cwd>, verified against the
-	#    live store. Birth time — not mtime — so a sibling pane working in the
-	#    same directory can never be mistaken for ours.
-	hash=$(printf '%s' "$PWD" | shasum -a256 | cut -d' ' -f1)
-	bucket=$(find "$HOME/.omp/agent/sessions" -maxdepth 1 -type d -name "*-$hash" | head -1)
-	[ -n "$bucket" ] || return 0
+	# 3. A session this pane created after it started. omp 17.2.10+ names the
+	#    bucket after the path itself (`-Projects-xdevteam.com-lobby`); older
+	#    sessions still carry the retired `<prefix>-<name>-<sha256 of cwd>`
+	#    form, so try the hash as a fallback. Birth time — not mtime — so a
+	#    sibling pane working in the same directory can never be mistaken for
+	#    ours.
+	# ponytail: no tmpdir branch — omp's `-tmp-…` form only covers
+	# $TMPDIR (/var/folders/… on macOS), which no pane runs in.
+	cwd=$(cd "$PWD" && pwd -P)
+	home=$(cd "$HOME" && pwd -P)
+	case $cwd in
+	"$home") bucket="$HOME/.omp/agent/sessions/-" ;;
+	"$home"/*) bucket="$HOME/.omp/agent/sessions/-$(printf '%s' "${cwd#"$home"/}" | tr '/:' '--')" ;;
+	*) bucket="$HOME/.omp/agent/sessions/--$(printf '%s' "${cwd#/}" | tr '/:' '--')--" ;;
+	esac
+	if [ ! -d "$bucket" ]; then
+		hash=$(printf '%s' "$PWD" | shasum -a256 | cut -d' ' -f1)
+		bucket=$(find "$HOME/.omp/agent/sessions" -maxdepth 1 -type d -name "*-$hash" | head -1)
+		[ -n "$bucket" ] || return 0
+	fi
 
 	cand=$(find "$bucket" -maxdepth 1 -name '*.jsonl' \
 		-exec stat -f '%B %N' {} + 2>/dev/null |
