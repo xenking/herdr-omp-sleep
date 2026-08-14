@@ -1,0 +1,135 @@
+#!/usr/bin/env bun
+// Render a session .jsonl the way omp itself draws it — colours, bubbles,
+// tool-call cards, usage footers — by building omp's OWN transcript components
+// and asking them for their rows.
+//
+// omp's TUI components implement `render(width): readonly string[]`
+// (pi-tui/src/tui.ts:150). ChatTranscriptBuilder.rebuild(entries) is what the
+// TUI itself calls to turn session records into that component tree, so
+// container.render(cols) is the real frame — not an imitation of it, and not
+// the plain-markdown `/dump` text (that one is `--md` below, useful for
+// grepping a conversation but visually nothing like the session).
+//
+// setExpanded(true) is deliberate: this is a history view, so tool output is
+// shown in full rather than collapsed to the 3 lines the live TUI starts with.
+//
+// Measured: 35 MB / 4605 records / 2871 messages -> 57,277 rows in 2.5s.
+//
+// Usage: omp-render [--md] <session.jsonl> [width]
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+
+const argv = process.argv.slice(2);
+let markdown = false;
+if (argv[0] === "--md") {
+	markdown = true;
+	argv.shift();
+}
+const sess: string | undefined = argv[0];
+if (sess === undefined || !existsSync(sess)) {
+	console.error("usage: omp-render [--md] <session.jsonl> [width]");
+	process.exit(2);
+}
+const width = Number(argv[1] ?? process.env.COLUMNS ?? 120) || 120;
+
+// Resolved at run time, not baked: an omp upgrade replaces this tree wholesale.
+const src = `${homedir()}/.bun/install/global/node_modules/@oh-my-pi/pi-coding-agent/src`;
+if (!existsSync(src)) {
+	console.error(`omp-render: omp source tree gone (${src})`);
+	process.exit(3);
+}
+
+interface Entry {
+	id?: string;
+	parentId?: string;
+	type?: string;
+	message?: unknown;
+}
+
+const entries: Entry[] = [];
+for (const line of (await Bun.file(sess).text()).split("\n")) {
+	if (line.trim().length === 0) continue;
+	try {
+		entries.push(JSON.parse(line) as Entry);
+	} catch {
+		// A session file being appended to can end mid-line; skip it.
+	}
+}
+if (entries.length === 0) {
+	console.error("omp-render: no records");
+	process.exit(4);
+}
+
+// Sleeping can fork the session tree, and a fork leaves dead siblings in the
+// file. Walk parentId back from the newest record so the render shows the same
+// branch omp would resume onto, not every abandoned turn.
+const byId = new Map<string, Entry>();
+for (const entry of entries) {
+	if (entry.id !== undefined) byId.set(entry.id, entry);
+}
+const branch: Entry[] = [];
+const seen = new Set<string>();
+let cursor: Entry | undefined = entries[entries.length - 1];
+while (cursor !== undefined) {
+	branch.push(cursor);
+	const parent: string | undefined = cursor.parentId;
+	if (parent === undefined || seen.has(parent)) break;
+	seen.add(parent);
+	cursor = byId.get(parent);
+}
+branch.reverse();
+
+// A walk that reaches almost nothing is a broken or unlinked file, not a
+// one-message conversation: an interrupted write, a hand-made session, an older
+// record shape without parentId. Silently rendering the tip of such a file is
+// the failure this script exists to prevent, so fall back to file order — a
+// fork's dead sibling is a smaller lie than a lost conversation.
+const selected = branch.length >= entries.length * 0.6 ? branch : entries;
+const messageEntries = selected.filter(entry => entry.type === "message" && entry.message !== undefined);
+
+if (markdown) {
+	const { formatSessionDumpText } = (await import(`${src}/session/session-dump-format.ts`)) as {
+		formatSessionDumpText: (options: { messages: readonly unknown[] }) => string;
+	};
+	process.stdout.write(formatSessionDumpText({ messages: messageEntries.map(entry => entry.message) }));
+	process.exit(0);
+}
+
+// Both must run before the components are imported: their constructors read
+// settings and the theme at module scope.
+const { Settings } = (await import(`${src}/config/settings.ts`)) as {
+	Settings: { init(options: Record<string, unknown>): Promise<unknown> };
+};
+await Settings.init({});
+const { initTheme } = (await import(`${src}/modes/theme/theme.ts`)) as {
+	initTheme: (enableWatcher?: boolean) => Promise<void>;
+};
+await initTheme(false);
+
+const { ChatTranscriptBuilder } = (await import(`${src}/modes/components/chat-transcript-builder.ts`)) as {
+	ChatTranscriptBuilder: new (deps: Record<string, unknown>) => {
+		rebuild(entries: readonly unknown[]): void;
+		setExpanded(expanded: boolean): void;
+		container: { render(width: number): readonly string[] };
+		dispose?(): void;
+	};
+};
+
+// The component tree only ever asks the TUI to schedule a repaint (spinners,
+// arriving tool output) and for its image budget. Nothing here is live, so a
+// no-op host is the whole contract.
+const builder = new ChatTranscriptBuilder({
+	ui: {
+		requestRender() {},
+		requestComponentRender() {},
+		resetDisplay() {},
+		imageBudget: undefined,
+	},
+	cwd: process.cwd(),
+	requestRender: () => {},
+});
+builder.setExpanded(true);
+builder.rebuild(messageEntries as readonly unknown[]);
+process.stdout.write(`${builder.container.render(width).join("\n")}\n`);
+builder.dispose?.();
+process.exit(0);

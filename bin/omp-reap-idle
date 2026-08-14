@@ -37,6 +37,7 @@ now=$(date +%s)
 slept=0
 retired=0
 badged=0
+revived=0
 
 # Idle age comes from the last real conversation turn, NOT the file mtime.
 # Plenty of things append to a session without you touching it — idle
@@ -212,11 +213,14 @@ while IFS=$'\t' read -r pane sess focused; do
 	# (ARCHITECTURE.md §8 / ADR 0008). Only the rows herdr still holds survive;
 	# omp is on the alternate screen, so deeper history has to come from the
 	# session file instead.
+	# A screenful and a half, not a thousand rows: the transcript above the
+	# frame is omp's own formatter now, complete, so everything the frame adds
+	# beyond the screen you actually left is duplicated text.
 	# Rows arrive as a terminal grid: padded with spaces to the full pane width
 	# and terminated with CR. Fed to a pager that is exactly as wide, every row
 	# wraps by the padding and you get a blank line after every single line.
 	# Drop the CR and the trailing pad (keeping any reset that follows it).
-	herdr pane read "$pane" --source recent --lines 1000 --format ansi 2>/dev/null \
+	herdr pane read "$pane" --source recent --lines 150 --format ansi 2>/dev/null \
 		| tr -d '\r' \
 		| sed -E $'s/[[:space:]]+(\033\\[0m)?$/\\1/' \
 		>"$HOME/.omp/agent/frozen/$pane.ans" || true
@@ -274,6 +278,7 @@ done < <(herdr agent list | jq -r --argjson p "$(herdr pane list)" '
 badger=$(command -v "$(dirname "$0")/omp-pane" 2>/dev/null || command -v omp-pane 2>/dev/null || true)
 [ "$slept" = 0 ] || sleep 2 # give a pane just killed a moment to reach its pager
 labels=$(herdr agent list | jq -r '.result.agents[]? | "\(.pane_id)\t\(.agent)"')
+panes_json=$(herdr pane list)
 while read -r pane; do
 	[ -n "$pane" ] && [ -n "$badger" ] || continue
 	[ -z "$ONLY" ] || [ "$pane" = "$ONLY" ] || continue
@@ -291,7 +296,102 @@ while read -r pane; do
 	printf '%s badged %s (parked by a pre-badge wrapper)\n' \
 		"$(date +%FT%T)" "$pane" >>"$LOG"
 	badged=$((badged + 1))
-done < <(herdr pane list | jq -r '.result.panes[]? | .pane_id')
+done < <(printf '%s' "$panes_json" | jq -r '.result.panes[]? | .pane_id')
+
+# A herdr restart restores each pane's layout but not its command line, so every
+# parked pane comes back as a bare shell holding nothing, and the session it was
+# showing is reachable only through this log (2026-08-13: 32 of 41 panes came up
+# this way). Put them back the way they went to sleep — `omp-pane --parked`
+# re-opens the frozen view, which costs a pager instead of an omp.
+#
+# The marker is the baked frame, and it means exactly "parked, or a pager that
+# died under it": omp-frozen deletes it when you press `q` (exit 1, never on a
+# signal), and the wrapper deletes it when omp quits with no sleep hint —
+# `/exit`, Ctrl-C, a crash. So a pane you left on purpose is never restored,
+# and a pane whose pager was killed out from under it always is. Frame age is
+# NOT a discriminator: a pane parked in place keeps the shell it was launched
+# from, which is older than its own frame (wC:p11, 2026-08-15).
+#
+# Prune first: a frame for a pane herdr no longer lists is litter from a closed
+# pane, and 12 of 21 on this machine were exactly that.
+for frame in "$HOME/.omp/agent/frozen"/*.ans; do
+	[ -e "$frame" ] || continue
+	pane=$(basename "$frame" .ans)
+	# Explicit ifs, not `test && continue`: bash exempts the left side of a
+	# `&&` from `set -e`, but the shape invites the reader to doubt it.
+	if printf '%s' "$panes_json" |
+		jq -e --arg p "$pane" '.result.panes[]? | select(.pane_id == $p)' >/dev/null 2>&1; then
+		continue
+	fi
+	if [ "${DRY_RUN:-0}" = 1 ]; then
+		printf 'would drop stale frame %s\n' "$pane"
+		continue
+	fi
+	rm -f "$frame" "$HOME/.omp/agent/frozen/$pane.session"
+done
+cands=""
+while read -r pane; do
+	[ -n "$pane" ] || continue
+	[ -z "$ONLY" ] || [ "$pane" = "$ONLY" ] || continue
+	frame="$HOME/.omp/agent/frozen/$pane.ans"
+	[ -s "$frame" ] || continue
+	pinfo=$(herdr pane process-info --pane "$pane" 2>/dev/null) || continue
+	# omp, a pager, or the wrapper: the pane is not an orphaned shell.
+	printf '%s' "$pinfo" | jq -e '.result.process_info.foreground_processes[]?
+		| select(.cmdline | test("omp|less"))' >/dev/null 2>&1 && continue
+	spid=$(printf '%s' "$pinfo" | jq -r '.result.process_info.foreground_processes[]?.pid' | head -1)
+	[ -n "$spid" ] || continue
+	sage=$(pid_minutes "$spid")
+	[ -n "$sage" ] || sage=0
+	fmtime=$(stat -f %m "$frame" 2>/dev/null) || continue
+	fage=$(((now - fmtime) / 60))
+
+	sess=$(grep " slept $pane " "$LOG" 2>/dev/null | tail -1 | sed -E 's/.*resume=//')
+	[ -n "$sess" ] || continue
+	if [ ! -f "$sess" ]; then
+		# omp renames its session buckets between versions; the id is stable.
+		sess=$(find "$HOME/.omp/agent/sessions" -maxdepth 2 -name "*_${sess##*_}" 2>/dev/null | head -1)
+		[ -n "$sess" ] && [ -f "$sess" ] || continue
+	fi
+
+	# herdr reuses pane ids. Restoring a session from another directory into a
+	# recycled pane would hand you somebody else's conversation, so the
+	# session's bucket has to be the one this cwd resolves to — both of omp's
+	# naming forms (see resolve_session in omp-pane).
+	pcwd=$(printf '%s' "$panes_json" |
+		jq -r --arg p "$pane" '.result.panes[]? | select(.pane_id == $p) | .cwd // empty')
+	[ -n "$pcwd" ] || continue
+	case $pcwd in
+	"$HOME") want="-" ;;
+	"$HOME"/*) want="-$(printf '%s' "${pcwd#"$HOME"/}" | tr '/:' '--')" ;;
+	*) want="--$(printf '%s' "${pcwd#/}" | tr '/:' '--')--" ;;
+	esac
+	got=$(basename "$(dirname "$sess")")
+	if [ "$got" != "$want" ]; then
+		[ "$got" = "${got%-*}-$(printf '%s' "$pcwd" | shasum -a256 | cut -d' ' -f1)" ] || continue
+	fi
+
+	cands="$cands$pane	$sage	$fage	$sess
+"
+done < <(printf '%s' "$panes_json" | jq -r '.result.panes[]? | .pane_id')
+
+# Two panes can name the same session: the reaper resolves a bare pane's
+# session by picking the newest file in its bucket, so two panes open on one
+# repo can both log the same path (wN:p1 and wN:p3, 2026-08-14). Restoring it
+# twice would put two omps on one .jsonl the moment both are woken. The pane
+# that slept last — the smallest frame age — owns it; the other stays a shell.
+while IFS=$'\t' read -r pane sage fage sess; do
+	[ -n "$pane" ] || continue
+	if [ "${DRY_RUN:-0}" = 1 ]; then
+		printf 'would revive %-8s shell=%sm frame=%sm %s\n' "$pane" "$sage" "$fage" "$sess"
+		continue
+	fi
+	herdr pane run "$pane" omp-pane --parked "--resume=$sess" >/dev/null 2>&1 || continue
+	printf '%s revived %s shell=%sm frame=%sm resume=%s\n' \
+		"$(date +%FT%T)" "$pane" "$sage" "$fage" "$sess" >>"$LOG"
+	revived=$((revived + 1))
+done < <(printf '%s' "$cands" | sort -t$'\t' -k4,4 -k3,3n | awk -F'\t' 'NF == 4 && !seen[$4]++')
 
 [ "${DRY_RUN:-0}" = 1 ] ||
-	printf 'slept %s, retired %s, badged %s pane(s)\n' "$slept" "$retired" "$badged"
+	printf 'slept %s, retired %s, badged %s, revived %s pane(s)\n' \
+		"$slept" "$retired" "$badged" "$revived"

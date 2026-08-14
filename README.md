@@ -5,8 +5,10 @@ A live `omp` coding-agent session running in a herdr pane holds roughly 400 MB o
 ## What you get
 
 - Idle panes sleep after N minutes (default 15), ENTER wakes them back into the same session, and q/Ctrl-C leaves a sleeping pane at its shell.
-- The frozen view isn't a screenshot: the whole conversation is rendered from the session's `.jsonl`, and omp's own last frame is appended underneath it verbatim, so colors and tool-call cards are exactly what you were looking at. The reaper bakes that frame with `herdr pane read --format ansi` while omp is still alive.
+- The frozen view is not a screenshot and not a description: the whole conversation is re-rendered by **omp's own transcript components**, so you get real colours, message bubbles, tool-call cards and usage footers, with tool output expanded in full. omp's last live frame is appended underneath it verbatim, so the bottom of the screen is exactly what you left. Measured: a 35 MB session → 69,445 rows, 1,305 tool-call cards, 2.5 s.
+- `omp-hist` opens that same full render for a **live** session at any time. Compaction shrinks what the model sees and takes the TUI's scrollback with it; the `.jsonl` on disk keeps everything, and this is how you read it.
 - The pane stays in herdr's agents sidebar as a dim `omp (sleeping)` row instead of dropping off the list. Live panes keep their normal green state.
+- A herdr restart no longer strands parked panes: the reaper puts them back into their frozen view on its next tick — 27 panes on this machine after the server died.
 - A session nobody ever typed into is retired to its shell rather than parked — see [Sessions with no conversation](#sessions-with-no-conversation).
 - An unsent message is never lost — see [Unsent messages](#unsent-messages).
 
@@ -20,13 +22,19 @@ graph LR
     B --> C["Frozen view"]
     C -->|"ENTER"| A
     C -->|"q / Ctrl-C"| D["Shell"]
+    E["herdr restart"] --> F["Bare shell"]
+    F -->|"omp-reap-idle: next tick"| C
 ```
 
-**`omp-reap-idle`** runs on a 900-second launchd schedule. It asks herdr for every idle, unfocused pane, works out how long each has really been idle from the session's last conversation turn, and — once a pane clears the threshold and passes every guard below — bakes the pane's current frame with `herdr pane read --format ansi` and sends omp a SIGTERM. For a pane that was never started through the wrapper, it also waits for the shell to come back and types `omp-pane --parked` into it, so sleep behaves the same no matter how the pane began. Two smaller jobs ride along on the same tick: retiring sessions that have no conversation in them, and labelling parked panes whose wrapper is too old to label itself.
+**`omp-reap-idle`** runs on a 900-second launchd schedule. It asks herdr for every idle, unfocused pane, works out how long each has really been idle from the session's last conversation turn, and — once a pane clears the threshold and passes every guard below — bakes the pane's current frame with `herdr pane read --format ansi` and sends omp a SIGTERM. For a pane that was never started through the wrapper, it also waits for the shell to come back and types `omp-pane --parked` into it, so sleep behaves the same no matter how the pane began. Smaller jobs ride along on the same tick: retiring sessions that have no conversation in them, labelling parked panes whose wrapper is too old to label itself, putting parked panes back after a herdr restart has dropped them to a shell, and pruning baked frames for panes herdr no longer lists.
 
 **`omp-pane`** is what herdr templates should run instead of bare `omp`. It runs omp, and when omp exits because the reaper sent SIGTERM, it resolves which session just ended (the reaper's hint file first, an explicit `--resume=`, or the newest matching session born after the pane started; if none of that resolves to a real file, it exits to the shell instead of guessing), badges the pane `omp (sleeping)` in herdr's sidebar over the same socket omp's own integration uses, and hands off to `omp-frozen`. User Ctrl-C is treated as an explicit close and exits to the shell instead of parking.
 
-**`omp-frozen`** renders the whole conversation from the session's `.jsonl` — user turns, assistant text and tool calls, truncated tool output — into a cached, colored text view, then appends the exact frame the reaper baked while omp was still running, so the bottom of the screen is exactly what you left. It opens the result in `less`, scrolled to the bottom, with ENTER wired to wake and q/Ctrl-C wired to exit to the shell.
+**`omp-frozen`** builds the view — the rendered transcript plus the baked frame — and opens it in `less`, scrolled to the bottom, with ENTER wired to wake and `q`/Ctrl-C wired to exit to the shell. The render is cached per session *and per width* (omp's components pre-wrap every row, so a resized pane needs a new render, not a folded old one), and the cache is invalidated when either the session or the renderer is newer than it.
+
+**`omp-render`** is the renderer, and it is omp itself: `ChatTranscriptBuilder.rebuild(entries)` is the same call the live TUI makes to turn session records into components, and every component implements `render(width): readonly string[]` (`pi-tui/src/tui.ts:150`), so `container.render(cols)` returns omp's real rows. The only stubs are the no-op repaint hooks the tree would call on a live TUI. `--md` switches to omp's plain `/dump` formatter instead, which is useful for grepping a conversation but looks nothing like it. omp exposes no CLI route to either one: `--export` is HTML-only and `omp read history://` is the deliberately abridged formatter that collapses every tool result to a single line.
+
+**`omp-hist`** is the full history of a session on demand: `omp-hist` for the current pane, `omp-hist <pane-id>` for another, `omp-hist <session.jsonl>` for any file. On a tty it pages in place. Run from inside omp with `!omp-hist`, where stdout is a captured pipe, it splits the pane and pages there instead, so tens of thousands of rows never land in the agent's context.
 
 **`draft-keeper.ts`** is an omp extension that mirrors the composer's text to `~/.omp/agent/frozen/<pane>.draft` every 5 seconds and once more on shutdown, and restores it into an empty composer on the next session start. Its only other reader is the reaper, which treats a non-empty draft file as a reason not to sleep the pane.
 
@@ -68,7 +76,7 @@ A wrapped pane is handed an *empty* hint file on the way out. That is the wrappe
 `install.sh` checks the first two before it installs anything:
 
 - macOS — the reaper is a launchd agent, and the scripts use BSD `stat -f` for file times.
-- `herdr`, `omp`, `jq`, `less`, and `nc` on `PATH`.
+- `herdr`, `omp`, `bun`, `jq`, `less`, and `nc` on `PATH`. `bun` renders the transcript through omp's own formatter; it ships with omp itself.
 
 Not version-checked by the installer, but required: herdr 0.8 or newer.
 
@@ -82,13 +90,13 @@ cd herdr-omp-sleep
 
 Options:
 
-- `--prefix DIR` — where the three scripts land. Default `~/.local/bin`.
+- `--prefix DIR` — where the five scripts land. Default `~/.local/bin`.
 - `--idle-min N` — minutes of inactivity before a pane sleeps. Default `15`. The reaper also derives `EMPTY_MIN` from it: 4×, the grace given to a session with no conversation.
 - `--herdr-templates` — also rewrite existing herdr pane templates from `command = "omp"` to `command = "omp-pane"`, backing up every file it touches and printing the list.
 - `--uninstall` — remove the scripts, the extension and the launchd agent (see [Uninstall](#uninstall)).
 - `-h`, `--help`
 
-This installs the three scripts (`omp-pane`, `omp-frozen`, `omp-reap-idle`) into `--prefix`; `draft-keeper.ts` into `$PI_CODING_AGENT_DIR/extensions` (default `~/.omp/agent/extensions`); and a launchd agent at `~/Library/LaunchAgents/com.$(id -un).omp-reap-idle.plist`, labelled `com.$(id -un).omp-reap-idle`, that runs the reaper every 900 seconds with `IDLE_MIN` set from `--idle-min` in its environment and stderr logged to `~/.local/state/omp-reap.err`.
+This installs the five scripts (`omp-pane`, `omp-frozen`, `omp-render`, `omp-hist`, `omp-reap-idle`) into `--prefix`; `draft-keeper.ts` into `$PI_CODING_AGENT_DIR/extensions` (default `~/.omp/agent/extensions`); and a launchd agent at `~/Library/LaunchAgents/com.$(id -un).omp-reap-idle.plist`, labelled `com.$(id -un).omp-reap-idle`, that runs the reaper every 900 seconds with `IDLE_MIN` set from `--idle-min` in its environment and stderr logged to `~/.local/state/omp-reap.err`.
 
 Make sure `--prefix` is on `PATH`: herdr templates launch the bare command name `omp-pane`, and the reaper does the same when it parks a pane that started life as bare `omp`. `install.sh` checks this itself and warns if it isn't.
 
@@ -138,7 +146,7 @@ launchctl print gui/$(id -u)/com.$(id -un).omp-reap-idle | grep -E 'state|runs'
 ./install.sh --uninstall
 ```
 
-Removes the three scripts from `--prefix`, `draft-keeper.ts` from the extensions directory, and the launchd agent. `~/.omp/agent/frozen/` — session hints, baked frames, unsent drafts — is left in place. As the uninstaller itself puts it: "Panes parked right now keep their frozen view until you press ENTER."
+Removes the four scripts from `--prefix`, `draft-keeper.ts` from the extensions directory, and the launchd agent. `~/.omp/agent/frozen/` — session hints, baked frames, unsent drafts — is left in place. As the uninstaller itself puts it: "Panes parked right now keep their frozen view until you press ENTER."
 
 ## Limits
 
@@ -152,6 +160,8 @@ Removes the three scripts from `--prefix`, `draft-keeper.ts` from the extensions
 - herdr's agent row for a pane can stop tracking that pane. Every omp started inside it reports through the same integration, so a nested session takes the row over, and when that one exits the row keeps its last state: a pane sat on a grey `done` for hours, its `state_change_seq` frozen, while the real omp ran turns underneath. Nothing outside can repair it — herdr accepts `pane.clear_agent_authority` and `pane.report_agent_session` from an official source with `ok` and applies neither. The next omp *start* in that pane fixes it, which sleeping and waking the pane does for you. The guards above are written so that a lying row costs you a delayed sleep, never a killed session.
 - Sleeping is still a signal, and omp records one on the way out. Normally that record is invisible: 38 sleeps across this machine's sessions, 37 of them clean. But if omp is holding a tool call it never resolved — an interrupted turn can leave one pending for hours — the exit record is parented to the turn that owns that call rather than to the end of the log, and waking the session materialises an aborted `Previous OMP process exited before completing the turn.` node underneath it. That forks the session tree, and omp resumes onto the fork, so everything the conversation did after that turn is on disk but out of context until you switch back to the main branch (`Esc Esc`, Enter on the last real turn). Nothing outside omp can prevent this; a pane you sleep with no pending calls never forks.
 - Reading a pane is not a signal the reaper can see. The uptime floor covers waking and reading, but if you sit in one session for longer than `IDLE_MIN` without sending anything, it will sleep under you. Screen contents are no help: an idle omp still repaints its burn-rate cell every second, so nothing in the grid distinguishes reading from being away.
+- A herdr restart drops every parked pane back to a bare shell — herdr restores the layout, not each pane's command line, so the `--resume=` the wrapper was holding is gone while the frozen view stays in the scrollback, which makes it look like the session died with it. The reaper repairs this on its next tick: a pane that is a bare shell, still carrying its baked frame, gets `omp-pane --parked` typed back into it with the session from the sleep log. The frame is the marker, and only a deliberate exit clears it — `q` in the frozen view (exit code 1, never a signal) or omp quitting with no sleep hint (`/exit`, Ctrl-C, a crash) — so a pane you left on purpose is never restored, and a pane whose pager was killed always is. Two panes that logged the same session are deduplicated (the one that slept last wins) so waking them cannot put two omps on one `.jsonl`, and the pane's cwd must resolve to the session's bucket, because herdr reuses pane ids. To do it by hand: `grep ' slept <pane> ' ~/.local/state/omp-reap.log | tail -1` names the file; if that path 404s, omp has moved the session since and the id after the `_` is stable, so `find ~/.omp/agent/sessions -maxdepth 2 -name '*<id>*.jsonl'` finds it.
+- Sleep is a marker on disk, not a state herdr knows about. A frame whose pane no longer exists is litter, so the reaper prunes frames for pane ids herdr no longer lists (11 of 21 on this machine were exactly that) — but a frame belonging to a pane that outlives its session directory is not distinguishable from a live one.
 
 ## License
 

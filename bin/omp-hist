@@ -1,0 +1,87 @@
+#!/bin/bash
+# Your full conversation, from disk — not what the agent still holds in context.
+#
+# omp's compaction is deliberate: it shrinks what the MODEL sees. But the TUI's
+# scrollback is rebuilt from that same pruned context, so the moment a
+# compaction lands you can no longer scroll back to your own words, and the
+# session looks like it started at the welcome banner (2026-08-14).
+#
+# The .jsonl on disk keeps everything — verified on a session with 11
+# compactions: all 26 pre-compaction user turns still present. This opens it
+# rendered by omp's own transcript components, so it looks like the session
+# looked: colours, bubbles, tool-call cards, usage footers, tool output in full.
+#
+# Usage:
+#   omp-hist                  # this pane's session (live or parked)
+#   omp-hist <pane-id>        # another pane's
+#   omp-hist <session.jsonl>  # any session file
+#
+# On a tty it pages right here. Anywhere else — `!omp-hist` typed inside omp,
+# where stdout is a captured pipe — it opens a split pane and pages there, so
+# tens of thousands of rows never land in the agent's context.
+set -euo pipefail
+
+arg=${1:-${HERDR_PANE_ID:-}}
+[ -n "$arg" ] || { echo "usage: omp-hist [pane-id | session.jsonl]" >&2; exit 2; }
+
+case $arg in
+*.jsonl)
+	sess=$arg
+	;;
+*)
+	# A live pane reports its session to herdr. A parked one does not — the
+	# agent leaves `agent list` when omp dies — so fall back to the reaper's
+	# hint file and then to its log.
+	sess=$(herdr agent list 2>/dev/null |
+		jq -r --arg p "$arg" '.result.agents[]? | select(.pane_id == $p)
+			| .agent_session.value // empty' | head -1) || sess=
+	[ -n "$sess" ] || sess=$(cat "$HOME/.omp/agent/frozen/$arg.session" 2>/dev/null || true)
+	[ -n "$sess" ] || sess=$(grep " slept $arg " "$HOME/.local/state/omp-reap.log" 2>/dev/null |
+		tail -1 | sed -E 's/.*resume=//')
+	;;
+esac
+
+# omp moves sessions between buckets as its naming scheme changes (a path that
+# resolved last week can 404 today), but the id after the final `_` is stable.
+if [ -n "${sess:-}" ] && [ ! -f "$sess" ]; then
+	sess=$(find "$HOME/.omp/agent/sessions" -maxdepth 2 -name "*_${sess##*_}" 2>/dev/null | head -1)
+fi
+[ -n "${sess:-}" ] && [ -f "$sess" ] || { echo "omp-hist: no session for $arg" >&2; exit 3; }
+
+if [ -t 1 ]; then
+	view=$(mktemp -t omp-hist)
+	trap 'rm -f "$view"' EXIT
+	omp-render "$sess" "$(tput cols 2>/dev/null || echo 120)" >"$view"
+	rows=$(wc -l <"$view" | tr -d ' ')
+	# Nerd Font glyphs from omp's own output live in the Unicode Private Use
+	# Area, which less otherwise escapes to <U+F090>.
+	export LESSUTFCHARDEF="E000-F8FF:p,F0000-FFFFD:p,100000-10FFFD:p"
+	# No -M: it selects less's LONG prompt, which silently overrides the short
+	# one -P sets, and you get the temp file's path instead of the banner.
+	# -S: rows are already exactly this wide, and `less -R` cannot measure the
+	# display width of true-colour escapes, so left to wrap it puts a blank line
+	# after every single row. -~ suppresses the tildes past the end.
+	exec less -R -S -~ +G \
+		-P "HISTORY  ${rows} lines  ·  ↑↓ PgUp/PgDn scroll  ·  /search  ·  q close  ?ltline %lt/${rows}." \
+		"$view"
+fi
+
+[ -n "${HERDR_PANE_ID:-}" ] || {
+	echo "omp-hist: not a tty and not in a herdr pane — pipe it: omp-render $sess | less -R" >&2
+	exit 4
+}
+
+new=$(herdr pane split --pane "$HERDR_PANE_ID" --direction right --focus 2>/dev/null |
+	jq -r '.result.pane.pane_id // empty')
+[ -n "$new" ] || { echo "omp-hist: could not split $HERDR_PANE_ID" >&2; exit 5; }
+
+# `herdr pane run` TYPES the line into the pane's tty, so a shell that has not
+# reached its prompt eats it. A fresh pane has its shell within a second; give
+# it two and check the prompt is actually there before typing.
+self=$(command -v "$0" 2>/dev/null || echo omp-hist)
+for _ in 1 2 3 4 5 6 7 8; do
+	sleep 0.5
+	herdr pane read "$new" --source visible 2>/dev/null | grep -q '[^[:space:]]' && break
+done
+herdr pane run "$new" "$self" "$sess" >/dev/null 2>&1 || true
+printf 'full history (%s) opened in pane %s\n' "$(basename "$sess")" "$new"

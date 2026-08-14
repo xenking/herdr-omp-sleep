@@ -17,6 +17,12 @@ set -uo pipefail
 
 hint_dir="$HOME/.omp/agent/frozen"
 hint="$hint_dir/${HERDR_PANE_ID:-nopane}.session"
+# The baked frame doubles as the "this pane is parked" marker the reaper's
+# resurrection sweep reads. Every deliberate human exit clears it — `q` in the
+# frozen view (omp-frozen, exit 1) and a quit that leaves no hint (below) — so
+# what remains means: parked, or a pager that died under it. A herdr restart
+# kills the pager without asking, which is exactly the case worth restoring.
+frame="$hint_dir/${HERDR_PANE_ID:-nopane}.ans"
 mkdir -p "$hint_dir"
 
 # Keep the pane in herdr's agents sidebar while it sleeps, but dimmed.
@@ -124,7 +130,7 @@ started=$(date +%s)
 # them apart: omp leaves on 0 either way.
 run_omp() {
 	omp "$@"
-	[ -s "$hint" ] || { rm -f "$hint"; exit 0; }
+	[ -s "$hint" ] || { rm -f "$hint" "$frame"; exit 0; }
 }
 
 # `--parked`: come up already asleep. The reaper uses this to retrofit a sleep

@@ -17,56 +17,59 @@ sess=${1:?usage: omp-frozen <session.jsonl>}
 
 cache_dir="$HOME/.omp/agent/frozen"
 mkdir -p "$cache_dir"
-view="$cache_dir/$(basename "${sess%.jsonl}").txt"
+# omp's components pre-wrap every row to the width they were rendered at, so the
+# width is part of the cache identity: a pane resized since its last sleep needs
+# a new render, not a folded old one.
+cols=$(tput cols 2>/dev/null || echo 200)
+view="$cache_dir/$(basename "${sess%.jsonl}").$cols.ans.txt"
 
-# ponytail: rebuild only when the session outgrew its render. Cheap enough
-# (~0.4s for a 7 MB session) that no finer invalidation is worth it.
-if [ ! -f "$view" ] || [ "$sess" -nt "$view" ]; then
-	jq -r '
-	  def dim(s): "\u001b[2m" + s + "\u001b[0m";
-	  def trunc(s; n):
-	    (s | split("\n") | map("    " + .)) as $l
-	    | if ($l | length) > n
-	      then (($l[0:n] | join("\n")) + "\n" + dim("      … " + (($l | length) - n | tostring) + " more lines"))
-	      else ($l | join("\n")) end;
-
-	  select(.type == "message")
-	  | .message as $m
-	  | if $m.role == "user" then
-	      "\n\u001b[1;35m▌ YOU\u001b[0m\n"
-	      + ($m.content | if type == "array" then (map(select(.type == "text").text) | join("\n")) else tostring end)
-	    elif $m.role == "assistant" then
-	      ($m.content // [] | map(
-	         if .type == "text" then "\n" + .text
-	         elif .type == "thinking" then dim("  · thinking ·")
-	         elif .type == "toolCall" then
-	           "\u001b[36m  → " + (.name // "tool") + "\u001b[0m"
-	           + (if .intent then dim("  " + .intent) else "" end)
-	         else empty end) | join("\n"))
-	    elif $m.role == "toolResult" then
-	      ($m.content // [] | map(select(.type == "text").text) | join("\n")) as $t
-	      | if ($t | length) == 0 then empty
-	        else trunc($t; 3) end
-	    else empty end
-	' "$sess" >"$view"
+# Rebuild when the session outgrew its render — cheap enough (0.34s for an 18 MB
+# session) that no finer invalidation is worth it — or when the RENDERER is
+# newer than the view. Without that second clause a pane parked before an
+# upgrade keeps showing the render it was built with: the first native build
+# never reached the panes revived after a herdr restart, which came back
+# wearing the old 21% jq view (2026-08-14).
+renderer=$(command -v omp-render 2>/dev/null || true)
+stale=0
+if [ ! -f "$view" ]; then stale=1; fi
+if [ -f "$view" ] && [ "$sess" -nt "$view" ]; then stale=1; fi
+if [ -f "$view" ] && [ -n "$renderer" ] && [ "$renderer" -nt "$view" ]; then stale=1; fi
+if [ "$stale" = 1 ]; then
+	tmp="$view.$$"
+	# omp's OWN transcript components, through omp-render: real colours,
+	# bubbles, tool-call cards, usage footers — the session as it was drawn,
+	# not a description of it. There is no reduced fallback any more; the jq
+	# render this replaced showed 21% of a conversation as plain text, which IS
+	# the "where is my history" complaint. If omp's component tree moves, say
+	# so — a page that lies about your history is worse than an error page.
+	if ! omp-render "$sess" "$cols" >"$tmp" 2>"$tmp.err"; then
+		{
+			printf '\033[1;31m  omp-render failed — this is NOT your history\033[0m\n\n'
+			sed 's/^/  /' "$tmp.err" 2>/dev/null
+			printf '\n  Nothing is lost, the session file is intact:\n    %s\n\n' "$sess"
+			printf '  Read it:   omp --resume=%s\n' "$sess"
+			printf '  Or fix:    omp-render points at omp'"'"'s internal formatter path\n'
+		} >"$tmp"
+	fi
+	rm -f "$tmp.err"
+	mv -f "$tmp" "$view"
 fi
 
 # The pane's last rendered frame, baked by the reaper while omp was still up.
-# It is omp's own output, so colours and tool-call cards are exact; only the
-# rows above it are our reconstruction from the session file.
+# The transcript above it is omp's own formatter, so this is only here to make
+# the bottom of the screen the exact grid you left — same colours, same cards.
 baked="$cache_dir/${HERDR_PANE_ID:-nopane}.ans"
 combined=$(mktemp)
 trap 'rm -f "$combined" "$keys"' EXIT
 
-# `less -R` cannot measure the display width of true-colour escapes, so a
-# full-width row (omp draws a right border at the last column) is counted as
-# too long and wrapped — that is the blank line after every single line. `-S`
-# stops the pager wrapping at all; the reconstructed history is folded here
-# instead, where the text is plain and the width is known.
-cols=$(tput cols 2>/dev/null || echo 200)
-LC_ALL=${LC_ALL:-en_US.UTF-8} fold -s -w "$cols" <"$view" >"$combined"
+# Rows arrive pre-wrapped at exactly $cols by omp's own components, so there is
+# nothing left to fold and `-S` (no wrapping) keeps them intact: `less -R`
+# cannot measure the display width of true-colour escapes and would otherwise
+# treat a full-width row as too long and wrap it, putting a blank line after
+# every single line.
+cp "$view" "$combined"
 if [ -s "$baked" ]; then
-	printf '\n\033[2m%s native frame below — omp'"'"'s own rendering %s\033[0m\n\n' \
+	printf '\n\033[2m%s live frame %s\033[0m\n\n' \
 		'────────' '────────' >>"$combined"
 	cat "$baked" >>"$combined"
 fi
@@ -80,10 +83,23 @@ rows=$(wc -l <"$combined" | tr -d ' ')
 # unprintable and escapes to <U+F090>. Declare the three PUA blocks printable —
 # the exact incantation from less(1).
 export LESSUTFCHARDEF="E000-F8FF:p,F0000-FFFFD:p,100000-10FFFD:p"
-# +G opens at the bottom, on the native frame: the pane looks like you left it.
-less -R -S -K +G --lesskey-src="$keys" \
+# +G opens at the bottom, on the live frame: the pane looks like you left it.
+# -~ keeps a pane that was resized taller from showing a wall of tildes.
+rc=0
+less -R -S -K -~ +G --lesskey-src="$keys" \
 	-P "SLEEPING  ${rows} lines  ·  ↑↓ PgUp/PgDn scroll  ·  ENTER wake  ·  q close  ?ltline %lt/${rows}." \
-	"$combined"
+	"$combined" || rc=$?
+
+# ENTER leaves 0 and the wrapper wakes omp. `q`/Ctrl-C leave exactly 1 (the
+# lesskey above maps them to `quit 1`): an explicit close. Drop the baked frame
+# — it is the reaper's proof that this pane is parked, and the resurrection
+# sweep keys off it, so a pane you closed stays closed across a herdr restart.
+# Only code 1: a signal kill (143 for SIGTERM, 130 for a bare Ctrl-C reaching
+# less itself) is not a decision you made, and must not cost you the pane.
+# `[ … ] && rm` would abort the script with status 1 under `set -e` whenever the
+# test is false — which the wrapper reads as exactly the close it is not.
+if [ "$rc" = 1 ]; then rm -f "$baked"; fi
+exit "$rc"
 }
 
 

@@ -16,7 +16,7 @@ IDLE_MIN=15
 DO_TEMPLATES=0
 DO_UNINSTALL=0
 
-SCRIPTS=(omp-pane omp-frozen omp-reap-idle)
+SCRIPTS=(omp-pane omp-frozen omp-render omp-hist omp-reap-idle)
 
 die() {
 	printf 'error: %s\n' "$1" >&2
