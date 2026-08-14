@@ -32,12 +32,25 @@ baked="$cache_dir/${HERDR_PANE_ID:-nopane}.ans"
 # columns (2026-08-15). `stty` reads /dev/tty directly and gives the truth.
 term_cols() {
 	local size
-	size=$(stty size </dev/tty 2>/dev/null) && [ -n "$size" ] && {
-		printf '%s' "${size##* }"
-		return 0
-	}
+	# Only ask the tty when this process has one: opening /dev/tty without a
+	# controlling terminal can block outright — it hung an agent shell for two
+	# minutes (2026-08-15) — and a pager with no terminal has no width to find.
+	if [ -t 1 ] || [ -t 0 ]; then
+		size=$(stty size </dev/tty 2>/dev/null) && [ -n "$size" ] && {
+			printf '%s' "${size##* }"
+			return 0
+		}
+	fi
 	tput cols 2>/dev/null || echo 100
 }
+
+# lesskey's `quit` action takes the ASCII value of the first character of its
+# extra string as the exit status, NOT the string itself: `quit 1` leaves 49 and
+# `quit 2` leaves 50 (measured in a live pane). Comparing against 1 and 2 made
+# `r` fall out of the loop and hand the pane back to its shell — the exact
+# opposite of a re-render — and stopped `q` from clearing the parked marker.
+CLOSE_RC=49
+REWIDTH_RC=50
 
 # omp's components pre-wrap every row to the width they were rendered at, so the
 # width is part of the cache identity: a pane resized while parked needs a new
@@ -116,17 +129,16 @@ while :; do
 	less -R -S -K -~ ++G --lesskey-src="$keys" \
 		-P "SLEEPING  %lt/%L  ·  ↑↓ PgUp/PgDn scroll  ·  o full / O folded (%i of %m)  ·  r rewidth  ·  ENTER wake  ·  q close" \
 		"$fold_view" "$full_view" || rc=$?
-	[ "$rc" = 2 ] || break
+	[ "$rc" = "$REWIDTH_RC" ] || break
 done
 
-# ENTER leaves 0 and the wrapper wakes omp. `q`/Ctrl-C leave exactly 1 (the
-# lesskey above maps them to `quit 1`): an explicit close. Drop the baked frame
-# — it is the reaper's proof that this pane is parked, and the resurrection
-# sweep keys off it, so a pane you closed stays closed across a herdr restart.
-# Only code 1: a signal kill (143 for SIGTERM) is not a decision you made, and
-# must not cost you the pane. `[ … ] && rm` would abort the script with status 1
-# under `set -e` whenever the test is false — which the wrapper reads as exactly
-# the close it is not.
-if [ "$rc" = 1 ]; then rm -f "$baked"; fi
+# ENTER leaves 0 and the wrapper wakes omp. `q`/Ctrl-C leave $CLOSE_RC: an
+# explicit close. Drop the baked frame — it is the reaper's proof that this pane
+# is parked, and the resurrection sweep keys off it, so a pane you closed stays
+# closed across a herdr restart. Only that exact code: a signal kill (143 for
+# SIGTERM) is not a decision you made and must not cost you the pane. `[ … ] &&
+# rm` would abort the script with status 1 under `set -e` whenever the test is
+# false — which the wrapper reads as exactly the close it is not.
+if [ "$rc" = "$CLOSE_RC" ]; then rm -f "$baked"; fi
 exit "$rc"
 }

@@ -78,7 +78,10 @@ if [ -t 1 ]; then
 		less -R -S -~ ++G --lesskey-src="$keys" \
 			-P "HISTORY  %lt/%L  ·  ↑↓ PgUp/PgDn scroll  ·  o full / O folded (%i of %m)  ·  r rewidth  ·  /search  ·  q close" \
 			"$fold_view" "$full_view" || rc=$?
-		[ "$rc" = 2 ] || break
+		# lesskey's `quit` action exits with the ASCII value of the first
+		# character of its extra string, so `quit 2` is 50, not 2. Comparing
+		# against 2 made `r` quit the pager instead of re-rendering.
+		[ "$rc" = 50 ] || break
 	done
 	exit 0
 fi
