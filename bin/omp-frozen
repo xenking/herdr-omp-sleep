@@ -5,9 +5,11 @@
 {
 # Frozen view of an omp session: the whole conversation, scrollable, ~5 MB RSS.
 # Press ENTER to wake the session back into omp, or q/Ctrl-C to leave it at
-# the shell.
+# the shell. `o`/`O` unfold and re-fold tool output, `r` re-renders after a
+# resize.
 # Renders from the session .jsonl, not from terminal scrollback — omp draws on
-# herdr's host scrollback only ever holds the last screenful.
+# the alternate screen, so herdr's host scrollback only ever holds the last
+# screenful.
 #
 # Usage: omp-frozen <session.jsonl>
 set -euo pipefail
@@ -17,89 +19,114 @@ sess=${1:?usage: omp-frozen <session.jsonl>}
 
 cache_dir="$HOME/.omp/agent/frozen"
 mkdir -p "$cache_dir"
-# omp's components pre-wrap every row to the width they were rendered at, so the
-# width is part of the cache identity: a pane resized since its last sleep needs
-# a new render, not a folded old one.
-cols=$(tput cols 2>/dev/null || echo 200)
-view="$cache_dir/$(basename "${sess%.jsonl}").$cols.ans.txt"
+base="$cache_dir/$(basename "${sess%.jsonl}")"
 
-# Rebuild when the session outgrew its render — cheap enough (0.34s for an 18 MB
-# session) that no finer invalidation is worth it — or when the RENDERER is
-# newer than the view. Without that second clause a pane parked before an
-# upgrade keeps showing the render it was built with: the first native build
-# never reached the panes revived after a herdr restart, which came back
-# wearing the old 21% jq view (2026-08-14).
-renderer=$(command -v omp-render 2>/dev/null || true)
-stale=0
-if [ ! -f "$view" ]; then stale=1; fi
-if [ -f "$view" ] && [ "$sess" -nt "$view" ]; then stale=1; fi
-if [ -f "$view" ] && [ -n "$renderer" ] && [ "$renderer" -nt "$view" ]; then stale=1; fi
-if [ "$stale" = 1 ]; then
-	tmp="$view.$$"
+# The pane's last rendered frame, baked by the reaper while omp was still up.
+# The transcript above it is omp's own component tree, so this is only here to
+# make the bottom of the screen the exact grid you left.
+baked="$cache_dir/${HERDR_PANE_ID:-nopane}.ans"
+
+# `tput cols` reports 80 here, always: it asks the terminal through stdout, and
+# inside a command substitution stdout is a pipe, so it falls back to terminfo's
+# default. That silently rendered this machine's whole parked fleet at 80
+# columns (2026-08-15). `stty` reads /dev/tty directly and gives the truth.
+term_cols() {
+	local size
+	size=$(stty size </dev/tty 2>/dev/null) && [ -n "$size" ] && {
+		printf '%s' "${size##* }"
+		return 0
+	}
+	tput cols 2>/dev/null || echo 100
+}
+
+# omp's components pre-wrap every row to the width they were rendered at, so the
+# width is part of the cache identity: a pane resized while parked needs a new
+# render, not a folded old one. Two renders per width — folded is what omp shows
+# you by default (`expanded: false`, same default as `omp gallery`), unfolded is
+# every tool result in full — and `less` holds both, so `o`/`O` switch between
+# them without losing your place in either.
+build() {
+	local cols=$1 mode=$2 out=$3 tmp flag=
+	[ "$mode" = full ] && flag=--unfold
+	tmp="$out.$$"
 	# omp's OWN transcript components, through omp-render: real colours,
-	# bubbles, tool-call cards, usage footers — the session as it was drawn,
-	# not a description of it. There is no reduced fallback any more; the jq
-	# render this replaced showed 21% of a conversation as plain text, which IS
-	# the "where is my history" complaint. If omp's component tree moves, say
-	# so — a page that lies about your history is worse than an error page.
-	if ! omp-render "$sess" "$cols" >"$tmp" 2>"$tmp.err"; then
+	# bubbles, tool-call cards, usage footers — the session as it was drawn.
+	# There is no reduced fallback; the jq render this replaced showed a fifth
+	# of a conversation as plain text, which IS the "where is my history"
+	# complaint. If omp's component tree moves, say so — a page that lies about
+	# your history is worse than an error page.
+	if ! omp-render ${flag:+"$flag"} "$sess" "$cols" >"$tmp" 2>"$tmp.err"; then
 		{
 			printf '\033[1;31m  omp-render failed — this is NOT your history\033[0m\n\n'
 			sed 's/^/  /' "$tmp.err" 2>/dev/null
 			printf '\n  Nothing is lost, the session file is intact:\n    %s\n\n' "$sess"
 			printf '  Read it:   omp --resume=%s\n' "$sess"
-			printf '  Or fix:    omp-render points at omp'"'"'s internal formatter path\n'
 		} >"$tmp"
 	fi
 	rm -f "$tmp.err"
-	mv -f "$tmp" "$view"
-fi
+	if [ -s "$baked" ]; then
+		printf '\n\033[2m%s live frame %s\033[0m\n\n' '────────' '────────' >>"$tmp"
+		cat "$baked" >>"$tmp"
+	fi
+	mv -f "$tmp" "$out"
+}
 
-# The pane's last rendered frame, baked by the reaper while omp was still up.
-# The transcript above it is omp's own formatter, so this is only here to make
-# the bottom of the screen the exact grid you left — same colours, same cards.
-baked="$cache_dir/${HERDR_PANE_ID:-nopane}.ans"
-combined=$(mktemp)
-trap 'rm -f "$combined" "$keys"' EXIT
-
-# Rows arrive pre-wrapped at exactly $cols by omp's own components, so there is
-# nothing left to fold and `-S` (no wrapping) keeps them intact: `less -R`
-# cannot measure the display width of true-colour escapes and would otherwise
-# treat a full-width row as too long and wrap it, putting a blank line after
-# every single line.
-cp "$view" "$combined"
-if [ -s "$baked" ]; then
-	printf '\n\033[2m%s live frame %s\033[0m\n\n' \
-		'────────' '────────' >>"$combined"
-	cat "$baked" >>"$combined"
-fi
+# Rebuild when the session outgrew its render, or when the RENDERER is newer than
+# it. Without that second clause a pane parked before an upgrade keeps showing
+# the render it was built with: the first native build never reached the panes
+# revived after a herdr restart, which came back wearing the old jq view.
+renderer=$(command -v omp-render 2>/dev/null || true)
+ensure() {
+	local view=$1 mode=$2 cols=$3
+	if [ -f "$view" ] && [ ! "$sess" -nt "$view" ] &&
+		{ [ -z "$renderer" ] || [ ! "$renderer" -nt "$view" ]; } &&
+		{ [ ! -s "$baked" ] || [ ! "$baked" -nt "$view" ]; }; then
+		return 0
+	fi
+	build "$cols" "$mode" "$view"
+}
 
 keys=$(mktemp)
-printf '#command\n\\r quit\n\\n quit\nq quit 1\nQ quit 1\n^C quit 1\n' >"$keys"
-rows=$(wc -l <"$combined" | tr -d ' ')
+trap 'rm -f "$keys"' EXIT
+# `r` (quit 2) drops out of the pager so the loop below can re-render at the
+# width the pane has now; less itself cannot re-wrap rows omp already wrapped.
+printf '#command\n\\r quit\n\\n quit\nq quit 1\nQ quit 1\n^C quit 1\nr quit 2\no next-file\n^O next-file\nO prev-file\n' >"$keys"
 
-# Nerd Font icons (powerline separators, the model/branch glyphs in omp's
-# status line) live in the Unicode Private Use Area, which less treats as
-# unprintable and escapes to <U+F090>. Declare the three PUA blocks printable —
-# the exact incantation from less(1).
+# Nerd Font icons (powerline separators, the model/branch glyphs in omp's status
+# line) live in the Unicode Private Use Area, which less treats as unprintable
+# and escapes to <U+F090>. Declare the three PUA blocks printable — the exact
+# incantation from less(1).
 export LESSUTFCHARDEF="E000-F8FF:p,F0000-FFFFD:p,100000-10FFFD:p"
-# +G opens at the bottom, on the live frame: the pane looks like you left it.
-# -~ keeps a pane that was resized taller from showing a wall of tildes.
-rc=0
-less -R -S -K -~ +G --lesskey-src="$keys" \
-	-P "SLEEPING  ${rows} lines  ·  ↑↓ PgUp/PgDn scroll  ·  ENTER wake  ·  q close  ?ltline %lt/${rows}." \
-	"$combined" || rc=$?
+
+while :; do
+	cols=$(term_cols)
+	fold_view="$base.$cols.fold.ans.txt"
+	full_view="$base.$cols.full.ans.txt"
+	ensure "$fold_view" fold "$cols"
+	ensure "$full_view" full "$cols"
+
+	rc=0
+	# Rows arrive pre-wrapped at exactly $cols by omp's own components, so `-S`
+	# (no wrapping) keeps them intact: `less -R` cannot measure the display
+	# width of true-colour escapes and would otherwise treat a full-width row as
+	# too long and wrap it, putting a blank line after every single line.
+	# ++G opens EVERY file at the bottom (a bare +G is first-file-only, so the
+	# unfolded view landed at line 1 on the first `o`), on the live frame: the pane looks like you left it.
+	# -~ keeps a pane that was resized taller from showing a wall of tildes.
+	less -R -S -K -~ ++G --lesskey-src="$keys" \
+		-P "SLEEPING  %lt/%L  ·  ↑↓ PgUp/PgDn scroll  ·  o full / O folded (%i of %m)  ·  r rewidth  ·  ENTER wake  ·  q close" \
+		"$fold_view" "$full_view" || rc=$?
+	[ "$rc" = 2 ] || break
+done
 
 # ENTER leaves 0 and the wrapper wakes omp. `q`/Ctrl-C leave exactly 1 (the
 # lesskey above maps them to `quit 1`): an explicit close. Drop the baked frame
 # — it is the reaper's proof that this pane is parked, and the resurrection
 # sweep keys off it, so a pane you closed stays closed across a herdr restart.
-# Only code 1: a signal kill (143 for SIGTERM, 130 for a bare Ctrl-C reaching
-# less itself) is not a decision you made, and must not cost you the pane.
-# `[ … ] && rm` would abort the script with status 1 under `set -e` whenever the
-# test is false — which the wrapper reads as exactly the close it is not.
+# Only code 1: a signal kill (143 for SIGTERM) is not a decision you made, and
+# must not cost you the pane. `[ … ] && rm` would abort the script with status 1
+# under `set -e` whenever the test is false — which the wrapper reads as exactly
+# the close it is not.
 if [ "$rc" = 1 ]; then rm -f "$baked"; fi
 exit "$rc"
 }
-
-

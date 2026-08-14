@@ -49,21 +49,38 @@ fi
 [ -n "${sess:-}" ] && [ -f "$sess" ] || { echo "omp-hist: no session for $arg" >&2; exit 3; }
 
 if [ -t 1 ]; then
-	view=$(mktemp -t omp-hist)
-	trap 'rm -f "$view"' EXIT
-	omp-render "$sess" "$(tput cols 2>/dev/null || echo 120)" >"$view"
-	rows=$(wc -l <"$view" | tr -d ' ')
+	fold_view=$(mktemp -t omp-hist-fold)
+	full_view=$(mktemp -t omp-hist-full)
+	keys=$(mktemp -t omp-hist-keys)
+	trap 'rm -f "$fold_view" "$full_view" "$keys"' EXIT
+	# `o`/`O` switch between omp's folded tool output (its own default) and every
+	# result in full; less keeps a separate position in each file, so switching
+	# does not lose your place. `r` re-renders after a resize.
+	printf '#command\nq quit 1\nQ quit 1\n^C quit 1\nr quit 2\no next-file\n^O next-file\nO prev-file\n' >"$keys"
 	# Nerd Font glyphs from omp's own output live in the Unicode Private Use
 	# Area, which less otherwise escapes to <U+F090>.
 	export LESSUTFCHARDEF="E000-F8FF:p,F0000-FFFFD:p,100000-10FFFD:p"
-	# No -M: it selects less's LONG prompt, which silently overrides the short
-	# one -P sets, and you get the temp file's path instead of the banner.
-	# -S: rows are already exactly this wide, and `less -R` cannot measure the
-	# display width of true-colour escapes, so left to wrap it puts a blank line
-	# after every single row. -~ suppresses the tildes past the end.
-	exec less -R -S -~ +G \
-		-P "HISTORY  ${rows} lines  ·  ↑↓ PgUp/PgDn scroll  ·  /search  ·  q close  ?ltline %lt/${rows}." \
-		"$view"
+	while :; do
+		# `tput cols` answers 80 inside a command substitution — it asks through
+		# stdout, which is a pipe there — and omp's components pre-wrap rows to
+		# whatever width they are given. stty reads /dev/tty and tells the truth.
+		size=$(stty size </dev/tty 2>/dev/null || true)
+		cols=${size##* }
+		[ -n "$cols" ] || cols=$(tput cols 2>/dev/null || echo 100)
+		omp-render "$sess" "$cols" >"$fold_view"
+		omp-render --unfold "$sess" "$cols" >"$full_view"
+		rc=0
+		# No -M: it selects less's LONG prompt, which silently overrides the
+		# short one -P sets, and you get the temp file's path instead of the
+		# banner. -S: rows are already exactly this wide, and `less -R` cannot
+		# measure the display width of true-colour escapes, so left to wrap it
+		# puts a blank line after every single row.
+		less -R -S -~ ++G --lesskey-src="$keys" \
+			-P "HISTORY  %lt/%L  ·  ↑↓ PgUp/PgDn scroll  ·  o full / O folded (%i of %m)  ·  r rewidth  ·  /search  ·  q close" \
+			"$fold_view" "$full_view" || rc=$?
+		[ "$rc" = 2 ] || break
+	done
+	exit 0
 fi
 
 [ -n "${HERDR_PANE_ID:-}" ] || {

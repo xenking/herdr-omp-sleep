@@ -9,28 +9,41 @@
 // container.render(cols) is the real frame — not an imitation of it, and not
 // the plain-markdown `/dump` text (that one is `--md` below, useful for
 // grepping a conversation but visually nothing like the session).
+// Tool output follows omp's own default: folded. `--unfold` expands every tool
+// result in full, which is what `o` switches to in the frozen view. `omp
+// gallery` — omp's own component-rendering CLI — defaults the same way
+// (`args.expanded ?? false`), and this mirrors its width and theme handling too.
 //
-// setExpanded(true) is deliberate: this is a history view, so tool output is
-// shown in full rather than collapsed to the 3 lines the live TUI starts with.
+// Measured: 35 MB / 4605 records / 2871 messages -> 69,445 rows in 2.5s.
 //
-// Measured: 35 MB / 4605 records / 2871 messages -> 57,277 rows in 2.5s.
-//
-// Usage: omp-render [--md] <session.jsonl> [width]
+// Usage: omp-render [--md] [--unfold] <session.jsonl> [width]
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 
 const argv = process.argv.slice(2);
 let markdown = false;
-if (argv[0] === "--md") {
-	markdown = true;
-	argv.shift();
+let unfold = false;
+while (argv.length > 0 && argv[0]?.startsWith("--") === true) {
+	const flag = argv.shift();
+	if (flag === "--md") markdown = true;
+	else if (flag === "--unfold") unfold = true;
+	else {
+		console.error(`omp-render: unknown flag ${flag}`);
+		process.exit(2);
+	}
 }
 const sess: string | undefined = argv[0];
 if (sess === undefined || !existsSync(sess)) {
-	console.error("usage: omp-render [--md] <session.jsonl> [width]");
+	console.error("usage: omp-render [--md] [--unfold] <session.jsonl> [width]");
 	process.exit(2);
 }
-const width = Number(argv[1] ?? process.env.COLUMNS ?? 120) || 120;
+// Same resolution omp's gallery CLI uses (cli/gallery-cli.ts:181): a requested
+// width wins, else the terminal's, else 100 — clamped to what the components
+// are known to lay out sanely. process.stdout.columns is undefined whenever
+// stdout is a pipe, which is every call from omp-frozen, so the explicit
+// argument is the one that matters.
+const requested = Number(argv[1] ?? process.env.COLUMNS ?? process.stdout.columns ?? 100);
+const width = Math.max(40, Math.min(200, Number.isFinite(requested) ? requested : 100));
 
 // Resolved at run time, not baked: an omp upgrade replaces this tree wholesale.
 const src = `${homedir()}/.bun/install/global/node_modules/@oh-my-pi/pi-coding-agent/src`;
@@ -98,13 +111,31 @@ if (markdown) {
 // Both must run before the components are imported: their constructors read
 // settings and the theme at module scope.
 const { Settings } = (await import(`${src}/config/settings.ts`)) as {
-	Settings: { init(options: Record<string, unknown>): Promise<unknown> };
+	Settings: {
+		init(options: Record<string, unknown>): Promise<{ get(key: string): unknown }>;
+	};
 };
-await Settings.init({});
+const settings = await Settings.init({});
+// Exactly the call omp's own gallery CLI makes (cli/gallery-cli.ts:233). A bare
+// initTheme() picks up theme.dark/theme.light through getDefaultTheme, but the
+// symbol preset and colour-blind mode are separate arguments it never reads —
+// so a Nerd-Font setup rendered with ASCII fallbacks until these were passed.
 const { initTheme } = (await import(`${src}/modes/theme/theme.ts`)) as {
-	initTheme: (enableWatcher?: boolean) => Promise<void>;
+	initTheme: (
+		enableWatcher?: boolean,
+		symbolPreset?: unknown,
+		colorBlindMode?: unknown,
+		darkTheme?: unknown,
+		lightTheme?: unknown,
+	) => Promise<void>;
 };
-await initTheme(false);
+await initTheme(
+	false,
+	settings.get("symbolPreset"),
+	settings.get("colorBlindMode"),
+	settings.get("theme.dark"),
+	settings.get("theme.light"),
+);
 
 const { ChatTranscriptBuilder } = (await import(`${src}/modes/components/chat-transcript-builder.ts`)) as {
 	ChatTranscriptBuilder: new (deps: Record<string, unknown>) => {
@@ -128,7 +159,7 @@ const builder = new ChatTranscriptBuilder({
 	cwd: process.cwd(),
 	requestRender: () => {},
 });
-builder.setExpanded(true);
+builder.setExpanded(unfold);
 builder.rebuild(messageEntries as readonly unknown[]);
 process.stdout.write(`${builder.container.render(width).join("\n")}\n`);
 builder.dispose?.();

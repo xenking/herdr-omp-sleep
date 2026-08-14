@@ -329,6 +329,20 @@ for frame in "$HOME/.omp/agent/frozen"/*.ans; do
 	fi
 	rm -f "$frame" "$HOME/.omp/agent/frozen/$pane.session"
 done
+
+# Rendered views are the bulky part: two files per session per width, 26 MB for
+# one 35 MB conversation, 187 MB across this machine's fleet (2026-08-15). A
+# view for a width nobody uses any more, or for a session nobody opens, is dead
+# weight — and it rebuilds in seconds. Anything untouched for a week goes;
+# `less` keeps reading a file it already has open, so this is safe mid-pager.
+while IFS= read -r view; do
+	[ -n "$view" ] || continue
+	if [ "${DRY_RUN:-0}" = 1 ]; then
+		printf 'would drop cold view %s\n' "$(basename "$view")"
+		continue
+	fi
+	rm -f "$view"
+done < <(find "$HOME/.omp/agent/frozen" -maxdepth 1 -name '*.ans.txt' -mtime +7 2>/dev/null)
 cands=""
 while read -r pane; do
 	[ -n "$pane" ] || continue
