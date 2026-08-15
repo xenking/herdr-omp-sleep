@@ -129,7 +129,9 @@ started=$(date +%s)
 # it. Both of those hand the pane back to its shell. Exit codes cannot tell
 # them apart: omp leaves on 0 either way.
 run_omp() {
-	omp "$@"
+	# Herdr templates preserve the pane/socket variables but do not set this integration gate on
+	# a resumed wrapper. Without it OMP never reports its session path, so Collie cannot start voice.
+	HERDR_ENV=1 omp "$@"
 	[ -s "$hint" ] || { rm -f "$hint" "$frame"; exit 0; }
 }
 
