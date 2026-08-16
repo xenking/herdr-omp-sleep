@@ -17,6 +17,7 @@ DO_TEMPLATES=0
 DO_UNINSTALL=0
 
 SCRIPTS=(omp-pane omp-frozen omp-render omp-hist omp-reap-idle)
+EXTENSIONS=(draft-keeper.ts full-hist.ts)
 
 die() {
 	printf 'error: %s\n' "$1" >&2
@@ -73,8 +74,10 @@ if [ "$DO_UNINSTALL" = 1 ]; then
 		rm -f "$PREFIX/$s"
 		printf 'removed  %s\n' "$PREFIX/$s"
 	done
-	rm -f "$EXT_DIR/draft-keeper.ts"
-	printf 'removed  %s\n' "$EXT_DIR/draft-keeper.ts"
+	for e in "${EXTENSIONS[@]}"; do
+		rm -f "$EXT_DIR/$e"
+		printf 'removed  %s\n' "$EXT_DIR/$e"
+	done
 	printf 'kept     %s (session hints, baked frames, unsent drafts)\n' "$AGENT_DIR/frozen"
 	printf '\nPanes parked right now keep their frozen view until you press ENTER.\n'
 	exit 0
@@ -95,8 +98,10 @@ for s in "${SCRIPTS[@]}"; do
 	printf 'installed  %s\n' "$PREFIX/$s"
 done
 
-install -m 644 "$SRC/extensions/draft-keeper.ts" "$EXT_DIR/draft-keeper.ts"
-printf 'installed  %s\n' "$EXT_DIR/draft-keeper.ts"
+for e in "${EXTENSIONS[@]}"; do
+	install -m 644 "$SRC/extensions/$e" "$EXT_DIR/$e"
+	printf 'installed  %s\n' "$EXT_DIR/$e"
+done
 
 # The reaper runs from launchd, which hands a process almost no PATH. It calls
 # herdr, jq and omp by name, so give it the directories those actually live in.

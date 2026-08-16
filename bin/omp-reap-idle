@@ -206,24 +206,15 @@ while IFS=$'\t' read -r pane sess focused; do
 	mkdir -p "$HOME/.omp/agent/frozen"
 	printf '%s' "$sess" >"$HOME/.omp/agent/frozen/$pane.session"
 
-	# Bake omp's OWN rendering while it is still alive. herdr already
-	# emulated the terminal, so `--format ansi` hands back the finished grid —
-	# same colours, same tool-call cards, same layout you were looking at.
-	# This is the trick Collie uses to look native without emulating anything
-	# (ARCHITECTURE.md §8 / ADR 0008). Only the rows herdr still holds survive;
-	# omp is on the alternate screen, so deeper history has to come from the
-	# session file instead.
-	# A screenful and a half, not a thousand rows: the transcript above the
-	# frame is omp's own formatter now, complete, so everything the frame adds
-	# beyond the screen you actually left is duplicated text.
-	# Rows arrive as a terminal grid: padded with spaces to the full pane width
-	# and terminated with CR. Fed to a pager that is exactly as wide, every row
-	# wraps by the padding and you get a blank line after every single line.
-	# Drop the CR and the trailing pad (keeping any reset that follows it).
-	herdr pane read "$pane" --source recent --lines 150 --format ansi 2>/dev/null \
-		| tr -d '\r' \
-		| sed -E $'s/[[:space:]]+(\033\\[0m)?$/\\1/' \
-		>"$HOME/.omp/agent/frozen/$pane.ans" || true
+	# The parked marker. It used to be omp's last frame, baked with `herdr pane
+	# read --format ansi` and appended to the frozen view; the native render
+	# already ends where the conversation ends, so that only printed the last
+	# turn twice and the view stopped showing it (2026-08-16). What is left is
+	# the flag the resurrection sweep below keys off — "this pane is parked" —
+	# so it is one line, not 150 rows of terminal grid. The `.ans` suffix is
+	# kept because live panes on disk already use it.
+	printf '%s parked %s\n' "$(date +%FT%T)" "$sess" \
+		>"$HOME/.omp/agent/frozen/$pane.ans"
 
 	# SIGTERM, not SIGKILL: omp flushes a final record to the .jsonl on the way
 	# out, which is what keeps the session resumable.

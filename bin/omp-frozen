@@ -22,8 +22,10 @@ mkdir -p "$cache_dir"
 base="$cache_dir/$(basename "${sess%.jsonl}")"
 
 # The pane's last rendered frame, baked by the reaper while omp was still up.
-# The transcript above it is omp's own component tree, so this is only here to
-# make the bottom of the screen the exact grid you left.
+# Not shown any more — the render already ends where the conversation ends, so
+# appending it printed the final turn twice. It survives purely as the "this
+# pane is parked" marker: the reaper's resurrection sweep keys off it, and `q`
+# below deletes it to mean "I closed this on purpose".
 baked="$cache_dir/${HERDR_PANE_ID:-nopane}.ans"
 
 # `tput cols` reports 80 here, always: it asks the terminal through stdout, and
@@ -77,10 +79,6 @@ build() {
 		} >"$tmp"
 	fi
 	rm -f "$tmp.err"
-	if [ -s "$baked" ]; then
-		printf '\n\033[2m%s live frame %s\033[0m\n\n' '────────' '────────' >>"$tmp"
-		cat "$baked" >>"$tmp"
-	fi
 	mv -f "$tmp" "$out"
 }
 
@@ -88,16 +86,31 @@ build() {
 # it. Without that second clause a pane parked before an upgrade keeps showing
 # the render it was built with: the first native build never reached the panes
 # revived after a herdr restart, which came back wearing the old jq view.
+#
+# The baked frame is deliberately NOT part of this: it is not in the view any
+# more. The render already ends where the conversation ends, so appending omp's
+# last drawn screen printed the final turn twice (2026-08-16). The file stays as
+# the parked marker the reaper's resurrection sweep keys off — nothing displays
+# it.
 renderer=$(command -v omp-render 2>/dev/null || true)
 ensure() {
 	local view=$1 mode=$2 cols=$3
 	if [ -f "$view" ] && [ ! "$sess" -nt "$view" ] &&
-		{ [ -z "$renderer" ] || [ ! "$renderer" -nt "$view" ]; } &&
-		{ [ ! -s "$baked" ] || [ ! "$baked" -nt "$view" ]; }; then
+		{ [ -z "$renderer" ] || [ ! "$renderer" -nt "$view" ]; }; then
 		return 0
 	fi
 	build "$cols" "$mode" "$view"
 }
+
+# Claim the parked marker. The reaper writes one before it SIGTERMs omp, but a
+# pane parked any other way — `omp-pane --parked` typed in by hand, or by the
+# reaper's own restart sweep — never had one, and a pane with no marker is
+# invisible to that sweep: after a herdr restart it comes back a bare shell and
+# stays one (25 of 35 panes on this machine were in exactly that state,
+# 2026-08-16). The frozen view IS the parked state, so it says so itself.
+if [ -n "${HERDR_PANE_ID:-}" ]; then
+	printf '%s parked %s\n' "$(date +%FT%T)" "$sess" >"$baked"
+fi
 
 keys=$(mktemp)
 trap 'rm -f "$keys"' EXIT
