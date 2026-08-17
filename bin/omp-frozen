@@ -131,6 +131,16 @@ while :; do
 	ensure "$fold_view" fold "$cols"
 	ensure "$full_view" full "$cols"
 
+	# The legend has to fit the pane it is printed in. less truncates its
+	# prompt at the screen width, so on a narrow split `o full / O folded
+	# (1 of 2)` ate the middle of the line and `q close` fell off the end.
+	# Same keys in both, spelled out only where there is room; the terse one
+	# leads with the two that end the pane.
+	if [ "$cols" -ge 100 ]; then
+		prompt="SLEEPING  %lt/%L  ·  ↑↓ PgUp/PgDn  ·  o/O fold %i/%m  ·  r rewidth  ·  ENTER wake  ·  q close"
+	else
+		prompt="SLEEPING %lt/%L · ENTER wake · q close · o/O · r"
+	fi
 	rc=0
 	# Rows arrive pre-wrapped at exactly $cols by omp's own components, so `-S`
 	# (no wrapping) keeps them intact: `less -R` cannot measure the display
@@ -140,7 +150,7 @@ while :; do
 	# unfolded view landed at line 1 on the first `o`), on the live frame: the pane looks like you left it.
 	# -~ keeps a pane that was resized taller from showing a wall of tildes.
 	less -R -S -K -~ ++G --lesskey-src="$keys" \
-		-P "SLEEPING  %lt/%L  ·  ↑↓ PgUp/PgDn scroll  ·  o full / O folded (%i of %m)  ·  r rewidth  ·  ENTER wake  ·  q close" \
+		-P "$prompt" \
 		"$fold_view" "$full_view" || rc=$?
 	[ "$rc" = "$REWIDTH_RC" ] || break
 done

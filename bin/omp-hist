@@ -69,6 +69,13 @@ if [ -t 1 ]; then
 		[ -n "$cols" ] || cols=$(tput cols 2>/dev/null || echo 100)
 		omp-render "$sess" "$cols" >"$fold_view"
 		omp-render --unfold "$sess" "$cols" >"$full_view"
+		# less truncates its prompt at the screen width, so the legend is
+		# sized to the pane: see the same two tiers in omp-frozen.
+		if [ "$cols" -ge 100 ]; then
+			prompt="HISTORY  %lt/%L  ·  ↑↓ PgUp/PgDn  ·  o/O fold %i/%m  ·  r rewidth  ·  /search  ·  q close"
+		else
+			prompt="HISTORY %lt/%L · q close · o/O · r · /search"
+		fi
 		rc=0
 		# No -M: it selects less's LONG prompt, which silently overrides the
 		# short one -P sets, and you get the temp file's path instead of the
@@ -76,7 +83,7 @@ if [ -t 1 ]; then
 		# measure the display width of true-colour escapes, so left to wrap it
 		# puts a blank line after every single row.
 		less -R -S -~ ++G --lesskey-src="$keys" \
-			-P "HISTORY  %lt/%L  ·  ↑↓ PgUp/PgDn scroll  ·  o full / O folded (%i of %m)  ·  r rewidth  ·  /search  ·  q close" \
+			-P "$prompt" \
 			"$fold_view" "$full_view" || rc=$?
 		# lesskey's `quit` action exits with the ASCII value of the first
 		# character of its extra string, so `quit 2` is 50, not 2. Comparing
