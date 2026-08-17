@@ -39,6 +39,14 @@ retired=0
 badged=0
 revived=0
 
+# Who the human is actually looking at. `focused_pane_id` is server-wide: one
+# pane holds it, and it follows tab and pane switches. The per-pane `focused`
+# flag in `agent list` carries the same value, but reading it per row invites
+# treating focus as one signal among many, which is how the pane you were
+# reading got slept (see the veto in the loop below).
+focused_pane=$(herdr api snapshot 2>/dev/null |
+	jq -r '.result.snapshot.focused_pane_id // empty')
+
 # Idle age comes from the last real conversation turn, NOT the file mtime.
 # Plenty of things append to a session without you touching it — idle
 # compaction (compaction.idleEnabled, fires at idleTimeoutSeconds=300), the
@@ -62,9 +70,27 @@ pid_minutes() {
 		NF == 2 { print $1 + 0 }'
 }
 
-while IFS=$'\t' read -r pane sess focused; do
+while IFS=$'\t' read -r pane sess; do
 	[ -n "$pane" ] || continue
 	[ -z "$ONLY" ] || [ "$pane" = "$ONLY" ] || continue
+
+	# The pane in front of the human never sleeps. This used to be a soft
+	# hint — herdr's per-pane `focused` flag only quadrupled the threshold —
+	# because that flag goes stale true: wC:p1 still claimed focus 2.5 h
+	# after the last event (2026-08-07). The cost of softening it is worse
+	# than the cost of honouring it: a session you were READING, with the
+	# tab open in front of you, went to sleep at 75 idle minutes while you
+	# looked at it (wD:p1D, 2026-08-17). The snapshot names exactly ONE
+	# focused pane for the whole server, so honouring that costs at most one
+	# live omp, and it moves the moment you switch panes.
+	if [ -n "$focused_pane" ] && [ "$pane" = "$focused_pane" ]; then
+		if [ "${DRY_RUN:-0}" = 1 ]; then
+			printf 'skip %s focused\n' "$pane"
+		else
+			printf '%s skip %s focused\n' "$(date +%FT%T)" "$pane" >>"$LOG"
+		fi
+		continue
+	fi
 
 	# An unsent message in the composer. The draft-keeper extension mirrors it
 	# here. Text alone could be restored on wake, but a pasted image cannot —
@@ -187,14 +213,7 @@ while IFS=$'\t' read -r pane sess focused; do
 	# tick (burn-rate cell), so hashing it would sleep nothing, ever.
 	up=$(pid_minutes "$pid")
 	if [ -n "$up" ] && [ "$up" -lt "$age" ]; then age=$up; fi
-	# herdr only learns about focus from its own tab.focus events, so a pane
-	# keeps the flag while you work in another window: wC:p1 still claimed
-	# focus 2.5 h after the last event (2026-08-07). Honour it, but not
-	# forever — a pane you have not typed into for EMPTY_MIN is not one you
-	# are looking at, whatever the flag says.
-	min=$IDLE_MIN
-	[ "$focused" = true ] && min=$EMPTY_MIN
-	[ "$age" -ge "$min" ] || continue
+	[ "$age" -ge "$IDLE_MIN" ] || continue
 
 	if [ "${DRY_RUN:-0}" = 1 ]; then
 		printf 'would sleep %-8s pid=%-7s idle=%sm\n' "$pane" "$pid" "$age"
@@ -258,14 +277,19 @@ done < <(herdr agent list | jq -r --argjson p "$(herdr pane list)" '
 	| . as $a
 	| ($panes[] | select(.pane_id == $a.pane_id) | .terminal_title // "") as $title
 	| select($title | test("[\u2800-\u28ff]") | not)
-	| "\($a.pane_id)\t\($a.agent_session.value // "")\t\($a.focused)"')
+	| "\($a.pane_id)\t\($a.agent_session.value // "")"')
 
-# Panes that are parked but not wearing the badge: their wrapper body predates
-# it (bash froze the body at exec, and a wrapper that never re-execs never
-# grows it), so the pane sleeps while herdr still shows the dead session's
-# green `omp`. Labelling from here fixes those without touching the running
-# wrapper, and cannot mislabel a live pane — a running omp's own herdr hook
-# outranks this source, so the badge only becomes visible once omp is gone.
+# Two labels this pass repairs from outside, both caused by a wrapper body that
+# bash froze at exec (a long-lived wrapper never re-execs, so it can never grow
+# a fix):
+#
+#  - parked but not wearing the badge — the pane sleeps while herdr still shows
+#    the dead session's green `omp`. Cannot mislabel a live pane: a running
+#    omp's own hook outranks this source, so the badge only shows once omp is
+#    gone.
+#  - live omp with NO row at all — a pre-2026-08-17 body still releases the
+#    pane on wake, and nothing repaints an edge-triggered row until omp's next
+#    state change, which a long turn defers indefinitely (wD:p1D).
 badger=$(command -v "$(dirname "$0")/omp-pane" 2>/dev/null || command -v omp-pane 2>/dev/null || true)
 [ "$slept" = 0 ] || sleep 2 # give a pane just killed a moment to reach its pager
 labels=$(herdr agent list | jq -r '.result.agents[]? | "\(.pane_id)\t\(.agent)"')
@@ -273,10 +297,25 @@ panes_json=$(herdr pane list)
 while read -r pane; do
 	[ -n "$pane" ] && [ -n "$badger" ] || continue
 	[ -z "$ONLY" ] || [ "$pane" = "$ONLY" ] || continue
-	case $(printf '%s' "$labels" | awk -F'\t' -v p="$pane" '$1 == p { print $2 }') in
+	label=$(printf '%s' "$labels" | awk -F'\t' -v p="$pane" '$1 == p { print $2 }')
+	case $label in
 	"$BADGE") continue ;;
 	esac
-	herdr pane process-info --pane "$pane" 2>/dev/null |
+	pinfo=$(herdr pane process-info --pane "$pane" 2>/dev/null)
+	if [ -z "$label" ] && printf '%s' "$pinfo" |
+		jq -e '.result.process_info.foreground_processes[]?
+			| select(.cmdline | test("bin/omp(\\s|$)"))' >/dev/null 2>&1; then
+		if [ "${DRY_RUN:-0}" = 1 ]; then
+			printf 'would claim %s (live omp, no row)\n' "$pane"
+		else
+			"$badger" --awake "$pane"
+			printf '%s claimed %s (live omp released by an old wrapper)\n' \
+				"$(date +%FT%T)" "$pane" >>"$LOG"
+			badged=$((badged + 1))
+		fi
+		continue
+	fi
+	printf '%s' "$pinfo" |
 		jq -e '.result.process_info.foreground_processes[]?
 			| select(.cmdline | test("omp-frozen"))' >/dev/null 2>&1 || continue
 	if [ "${DRY_RUN:-0}" = 1 ]; then

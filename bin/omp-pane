@@ -42,13 +42,19 @@ mkdir -p "$hint_dir"
 # emitted, and stays behind whatever the next omp process seeds on wake.
 badge_label="omp (sleeping)"
 
+seq_bump=0
+
 herdr_req() {
 	# The socket path is in every pane's env; fall back to the default so the
 	# reaper — which runs from launchd with no pane around it — can reuse this.
 	local sock=${HERDR_SOCKET_PATH:-$HOME/.config/herdr/herdr.sock}
 	[ -S "$sock" ] && [ -n "${HERDR_PANE_ID:-}" ] || return 0
+	# Strictly increasing within this process: park and wake can land in the
+	# same second (the pager failing to open takes microseconds), and two
+	# calls sharing a second would make the second one a silent no-op.
+	seq_bump=$((seq_bump + 1))
 	printf '{"id":"omp-pane","method":"pane.%s","params":{"pane_id":"%s","seq":%s%s}}\n' \
-		"$1" "$HERDR_PANE_ID" "$(( ($(date +%s) + 1) * 1000000 ))" "$2" |
+		"$1" "$HERDR_PANE_ID" "$(( ($(date +%s) + seq_bump) * 1000000 ))" "$2" |
 		nc -U "$sock" >/dev/null 2>&1 || true
 }
 
@@ -59,21 +65,36 @@ badge_sleeping() {
 	herdr_req report_agent ",\"source\":\"omp-pane\",\"agent\":\"$badge_label\",\"state\":\"unknown\""
 }
 
-# Hand the pane back before omp starts, so its own integration owns it again.
+# Hand the pane back as a live row before omp starts.
+#
+# This used to be `release_agent`, on the theory that omp's own integration
+# would own the row again the moment it started. It does — but only on its next
+# state CHANGE, because every painter of that row is edge-triggered: herdr's
+# process detection re-reports when the pane's foreground process GROUP changes,
+# which under a wrapper it never does. So releasing left the pane with no row at
+# all, and a pane that woke straight into a long turn stayed missing from the
+# agents sidebar for as long as that turn ran — 10+ minutes on wD:p1D
+# (2026-08-17), while the work was visibly happening on screen.
+#
+# Reporting a live `omp` instead is never wrong for longer than one omp event:
+# omp's integration outranks this source and takes the row over, session path
+# and all, as soon as it says anything.
 badge_awake() {
-	herdr_req release_agent ",\"source\":\"omp-pane\",\"agent\":\"$badge_label\""
+	herdr_req report_agent ",\"source\":\"omp-pane\",\"agent\":\"omp\",\"state\":\"idle\""
 }
 
-# Label a pane that is already parked, from outside it.
+# Label a pane from outside it: `--badge` for parked, `--awake` for live.
 #
 # bash freezes a script's body at exec, so a wrapper that has been running
-# since before the badge existed can never grow it — and a long-lived wrapper
-# never re-execs either. Such a pane sleeps correctly but herdr keeps showing
-# the dead session's green `omp`. The reaper calls this to fix those; one entry
-# point keeps the sequence rule above in a single place.
-if [ "${1:-}" = --badge ]; then
+# since before either label existed can never grow it — and a long-lived wrapper
+# never re-execs either. A pane parked by such a wrapper sleeps correctly but
+# herdr keeps showing the dead session's green `omp`; a pane woken by one has no
+# row at all, because that body still calls `release_agent`. The reaper repairs
+# both from here, which keeps the sequence rule above in a single place.
+if [ "${1:-}" = --badge ] || [ "${1:-}" = --awake ]; then
+	only=$1
 	HERDR_PANE_ID=${2:-${HERDR_PANE_ID:-}}
-	badge_sleeping
+	if [ "$only" = --badge ]; then badge_sleeping; else badge_awake; fi
 	exit 0
 fi
 
