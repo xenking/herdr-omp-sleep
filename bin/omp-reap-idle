@@ -343,10 +343,18 @@ done < <(printf '%s' "$panes_json" | jq -r '.result.panes[]? | .pane_id')
 # from, which is older than its own frame (wC:p11, 2026-08-15).
 #
 # Prune first: a frame for a pane herdr no longer lists is litter from a closed
-# pane, and 12 of 21 on this machine were exactly that.
-for frame in "$HOME/.omp/agent/frozen"/*.ans; do
-	[ -e "$frame" ] || continue
-	pane=$(basename "$frame" .ans)
+# pane, and 12 of 21 on this machine were exactly that. Unsent drafts are swept
+# on the same rule, and they need their own glob: a pane that never slept has a
+# draft and no frame, so a frame-only sweep left those behind forever - and a
+# reused pane id would then restore a stranger's text into a new composer.
+seen=
+for litter in "$HOME/.omp/agent/frozen"/*.ans "$HOME/.omp/agent/frozen"/*.draft; do
+	[ -e "$litter" ] || continue
+	pane=$(basename "$litter")
+	pane=${pane%.ans}
+	pane=${pane%.draft}
+	case " $seen " in *" $pane "*) continue ;; esac
+	seen="$seen $pane"
 	# Explicit ifs, not `test && continue`: bash exempts the left side of a
 	# `&&` from `set -e`, but the shape invites the reader to doubt it.
 	if printf '%s' "$panes_json" |
@@ -354,10 +362,12 @@ for frame in "$HOME/.omp/agent/frozen"/*.ans; do
 		continue
 	fi
 	if [ "${DRY_RUN:-0}" = 1 ]; then
-		printf 'would drop stale frame %s\n' "$pane"
+		printf 'would drop stale %s %s\n' "$([ -e "$HOME/.omp/agent/frozen/$pane.ans" ] && printf frame || printf draft)" "$pane"
 		continue
 	fi
-	rm -f "$frame" "$HOME/.omp/agent/frozen/$pane.session"
+	rm -f "$HOME/.omp/agent/frozen/$pane.ans" \
+		"$HOME/.omp/agent/frozen/$pane.session" \
+		"$HOME/.omp/agent/frozen/$pane.draft"
 done
 
 # Rendered views are the bulky part: two files per session per width, 26 MB for
