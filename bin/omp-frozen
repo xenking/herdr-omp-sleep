@@ -82,10 +82,15 @@ build() {
 	mv -f "$tmp" "$out"
 }
 
-# Rebuild when the session outgrew its render, or when the RENDERER is newer than
-# it. Without that second clause a pane parked before an upgrade keeps showing
-# the render it was built with: the first native build never reached the panes
-# revived after a herdr restart, which came back wearing the old jq view.
+# Rebuild when the session outgrew its render, or when what RENDERS it is newer
+# than the view. Without that second clause a pane parked before an upgrade keeps
+# showing the render it was built with: the first native build never reached the
+# panes revived after a herdr restart, which came back wearing the old jq view.
+#
+# Two things can be newer, and the script is the less interesting one: `omp-render`
+# imports omp's own component tree out of the installed package, so an `omp`
+# upgrade changes every rendered row while this file's mtime sits still (17.3.0 ->
+# 17.4.0 moved the whole composer chrome, 2026-08-21). Watch the package too.
 #
 # The baked frame is deliberately NOT part of this: it is not in the view any
 # more. The render already ends where the conversation ends, so appending omp's
@@ -93,10 +98,13 @@ build() {
 # the parked marker the reaper's resurrection sweep keys off — nothing displays
 # it.
 renderer=$(command -v omp-render 2>/dev/null || true)
+omp_pkg="$HOME/.bun/install/global/node_modules/@oh-my-pi/pi-coding-agent/package.json"
+[ -f "$omp_pkg" ] || omp_pkg=
 ensure() {
 	local view=$1 mode=$2 cols=$3
 	if [ -f "$view" ] && [ ! "$sess" -nt "$view" ] &&
-		{ [ -z "$renderer" ] || [ ! "$renderer" -nt "$view" ]; }; then
+		{ [ -z "$renderer" ] || [ ! "$renderer" -nt "$view" ]; } &&
+		{ [ -z "$omp_pkg" ] || [ ! "$omp_pkg" -nt "$view" ]; }; then
 		return 0
 	fi
 	build "$cols" "$mode" "$view"
