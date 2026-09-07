@@ -33,6 +33,22 @@ BADGE="omp (sleeping)"
 LOG="$HOME/.local/state/omp-reap.log"
 mkdir -p "$(dirname "$LOG")"
 
+# Every conclusion this script draws — which frame is litter, which pane needs
+# reviving, which row needs a badge — is about ONE server's pane namespace, the
+# default one whose panes own the frames under ~/.omp/agent/frozen. A named
+# session (`herdr --session <name>`) has its own disjoint namespace, so its
+# answers are not wrong, they are about somebody else: on 2026-09-03 a probe
+# server holding a single pane satisfied the prune's "did herdr answer at all"
+# check and every one of the 68 real frames on this machine looked like litter.
+# Non-emptiness was never the invariant; identity is. Refuse the whole run
+# rather than gate one loop, because no loop here survives the wrong server.
+default_sock="$HOME/.config/herdr/herdr.sock"
+if [ -n "${HERDR_SOCKET_PATH:-}" ] && [ "$HERDR_SOCKET_PATH" != "$default_sock" ]; then
+	printf 'refusing: HERDR_SOCKET_PATH=%s is not the default server (%s)\n' \
+		"$HERDR_SOCKET_PATH" "$default_sock" >&2
+	exit 0
+fi
+
 now=$(date +%s)
 slept=0
 retired=0
@@ -58,6 +74,45 @@ idle_minutes() {
 	tail -200 "$1" | jq -rs '
 		[.[] | select(.type == "message") | .timestamp] | last
 		| if . then ((now - (.[0:19] + "Z" | fromdateiso8601)) / 60 | floor) else empty end'
+}
+
+# `herdr pane run` TYPES its argv into the pane's tty; it does not spawn. A
+# prompt still holding leftover keystrokes therefore concatenates them onto the
+# command: one stray character left in wC:p1W turned a revival into
+# `zsh: bad pattern: я[200~omp-pane …` and left that pane a bare shell while the
+# other 59 came back (2026-09-03). Kill the line first. ctrl+u, not ctrl+c —
+# the foreground process here is only known NOT to be omp or a pager, so it can
+# be something of the human's that an interrupt would take down.
+pane_run_clean() {
+	local pane=$1
+	shift
+	herdr pane send-keys "$pane" ctrl+u >/dev/null 2>&1 || true
+	herdr pane run "$pane" "$@" >/dev/null 2>&1
+}
+
+# Current title of a session: the last `title_change` if the conversation was
+# ever renamed, else the one stamped in the opening `session` record. grep
+# first — these files reach tens of megabytes and slurping one through jq to
+# read a single field is not worth it.
+session_title() {
+	local t=
+	t=$(grep -a '"type":"title_change"' "$1" 2>/dev/null | tail -1 |
+		jq -r '.title // empty' 2>/dev/null) || t=
+	[ -n "$t" ] || t=$(head -1 "$1" 2>/dev/null |
+		jq -r 'select(.type == "session") | .title // empty' 2>/dev/null) || t=
+	printf '%s' "$t"
+}
+
+# Minutes -> `5m` / `3h` / `2d`. Minutes because that is the unit every clock in
+# this script already speaks (IDLE_MIN, idle_minutes, pid_minutes).
+human_minutes() {
+	if [ "$1" -lt 60 ]; then
+		printf '%sm' "$1"
+	elif [ "$1" -lt 1440 ]; then
+		printf '%sh' $(($1 / 60))
+	else
+		printf '%sd' $(($1 / 1440))
+	fi
 }
 
 # Minutes since a pid started. macOS `ps` has no `etimes`, and the `date` on
@@ -262,7 +317,7 @@ while IFS=$'\t' read -r pane sess; do
 			"$(date +%FT%T)" "$pane" >>"$LOG"
 		continue
 	fi
-	herdr pane run "$pane" omp-pane --parked "--resume=$sess" >/dev/null 2>&1 || true
+	pane_run_clean "$pane" omp-pane --parked "--resume=$sess" || true
 done < <(herdr agent list | jq -r --argjson p "$(herdr pane list)" '
 	# `working`/`blocked` in the row is the first-choice "leave it alone", but
 	# the row can freeze: a nested session that reports and exits leaves the
@@ -328,6 +383,67 @@ while read -r pane; do
 	badged=$((badged + 1))
 done < <(printf '%s' "$panes_json" | jq -r '.result.panes[]? | .pane_id')
 
+# Make a sleeping row findable. herdr's agents panel orders by space or by
+# attention (`ui.agent_panel_sort`) and has no recency order at all, so 55
+# parked panes every one of which reads `omp (sleeping)` are a single
+# indistinguishable block — there is no way to tell which one holds yesterday's
+# work (2026-09-03). `pane report-metadata` is display-only and carries no
+# lifecycle authority, so the badge above and the whole sleep machinery stay
+# exactly as they are; only what the sidebar prints changes. Re-reported every
+# pass, which is what keeps the age honest.
+#
+# The badge is the gate, NOT the frame file: a frame survives a wake (it is what
+# a revival keys off, and omp-frozen only drops it when you close the view on
+# purpose), so gating on it labelled every LIVE pane too — a working session
+# advertising `0m · <title>` where it should say `omp` (2026-09-03). A pane that
+# no longer wears the badge gets its label taken back here, so the display never
+# depends on the wake path having fired.
+labelled=$(herdr agent list |
+	jq -r '.result.agents[]? | select(.display_agent) | .pane_id')
+while read -r pane; do
+	[ -n "$pane" ] || continue
+	[ -z "$ONLY" ] || [ "$pane" = "$ONLY" ] || continue
+	label=$(printf '%s' "$labels" | awk -F'\t' -v p="$pane" '$1 == p { print $2 }')
+	if [ "$label" != "$BADGE" ]; then
+		case " $(printf '%s' "$labelled" | tr '\n' ' ') " in
+		*" $pane "*)
+			if [ "${DRY_RUN:-0}" = 1 ]; then
+				printf 'would unlabel %-8s (awake)\n' "$pane"
+			else
+				herdr pane report-metadata "$pane" --source omp-pane \
+					--clear-display-agent >/dev/null 2>&1 || true
+			fi
+			;;
+		esac
+		continue
+	fi
+	# The frame flag is the per-pane record of what this pane is showing, written
+	# by whoever parked it. The log only has a ` slept <pane> ` line for a pane
+	# THIS script put to sleep, so a pane parked by the revival sweep, or by hand,
+	# stayed unlabelled among 50 identical `omp (sleeping)` rows — which is the
+	# whole problem the label exists to solve (2026-09-03: 9 restored panes).
+	sess=$(sed -n 's/^[^ ]* parked //p' "$HOME/.omp/agent/frozen/$pane.ans" 2>/dev/null | tail -1)
+	[ -n "$sess" ] ||
+		sess=$(grep " slept $pane " "$LOG" 2>/dev/null | tail -1 | sed -E 's/.*resume=//') ||
+		sess=
+	[ -n "$sess" ] && [ -f "$sess" ] || continue
+	title=$(session_title "$sess")
+	[ -n "$title" ] || continue
+	# The same clock the sleep decision trusts, for the same reason: mtime is
+	# bumped by the record omp flushes on SIGTERM, by idle compaction and by
+	# autolearn, so a pane whose last real turn was hours ago would advertise
+	# itself as minutes old — the exact lie idle_minutes() exists to avoid.
+	mins=$(idle_minutes "$sess") || mins=
+	[ -n "$mins" ] || mins=$(((now - $(stat -f %m "$sess")) / 60))
+	desc="$(human_minutes "$mins") · $title"
+	if [ "${DRY_RUN:-0}" = 1 ]; then
+		printf 'would label %-8s %s\n' "$pane" "$desc"
+		continue
+	fi
+	herdr pane report-metadata "$pane" --source omp-pane \
+		--display-agent "$desc" >/dev/null 2>&1 || true
+done < <(printf '%s' "$panes_json" | jq -r '.result.panes[]? | .pane_id')
+
 # A herdr restart restores each pane's layout but not its command line, so every
 # parked pane comes back as a bare shell holding nothing, and the session it was
 # showing is reachable only through this log (2026-08-13: 32 of 41 panes came up
@@ -347,8 +463,18 @@ done < <(printf '%s' "$panes_json" | jq -r '.result.panes[]? | .pane_id')
 # on the same rule, and they need their own glob: a pane that never slept has a
 # draft and no frame, so a frame-only sweep left those behind forever - and a
 # reused pane id would then restore a stranger's text into a new composer.
+# A pane list that came back empty proves nothing is litter: a server that has
+# not restored its workspaces yet, or a named-session server with its own empty
+# pane set, would make every frame on this machine look like garbage and delete
+# the lot. Zero panes is zero evidence, so the prune is skipped, not trusted.
+prunable=1
+if [ "$(printf '%s' "$panes_json" | jq -r '(.result.panes | length) // 0' 2>/dev/null || printf 0)" = 0 ]; then
+	prunable=0
+	[ "${DRY_RUN:-0}" != 1 ] || printf 'skip prune: herdr reported no panes\n'
+fi
 seen=
 for litter in "$HOME/.omp/agent/frozen"/*.ans "$HOME/.omp/agent/frozen"/*.draft; do
+	[ "$prunable" = 1 ] || break
 	[ -e "$litter" ] || continue
 	pane=$(basename "$litter")
 	pane=${pane%.ans}
@@ -440,7 +566,7 @@ while IFS=$'\t' read -r pane sage fage sess; do
 		printf 'would revive %-8s shell=%sm frame=%sm %s\n' "$pane" "$sage" "$fage" "$sess"
 		continue
 	fi
-	herdr pane run "$pane" omp-pane --parked "--resume=$sess" >/dev/null 2>&1 || continue
+	pane_run_clean "$pane" omp-pane --parked "--resume=$sess" || continue
 	printf '%s revived %s shell=%sm frame=%sm resume=%s\n' \
 		"$(date +%FT%T)" "$pane" "$sage" "$fage" "$sess" >>"$LOG"
 	revived=$((revived + 1))
