@@ -81,6 +81,13 @@ badge_sleeping() {
 # and all, as soon as it says anything.
 badge_awake() {
 	herdr_req report_agent ",\"source\":\"omp-pane\",\"agent\":\"omp\",\"state\":\"idle\""
+	# Drop the parked row's `<age> · <title>` display name. It is display-only
+	# metadata the reaper attaches so 50+ sleeping panes are tellable apart, and
+	# it outlives the badge it belongs to: left in place, a woken pane keeps
+	# advertising how long it slept instead of saying `omp`.
+	[ -z "${HERDR_PANE_ID:-}" ] ||
+		herdr pane report-metadata "$HERDR_PANE_ID" --source omp-pane \
+			--clear-display-agent >/dev/null 2>&1 || true
 }
 
 # Label a pane from outside it: `--badge` for parked, `--awake` for live.
@@ -149,11 +156,39 @@ started=$(date +%s)
 # a crash — and an empty hint is the reaper retiring a session with nothing in
 # it. Both of those hand the pane back to its shell. Exit codes cannot tell
 # them apart: omp leaves on 0 either way.
+#
+# "Hand the pane back to its shell" was only ever true for a wrapper the reaper
+# TYPED into a live prompt: there a shell is our parent and outlives us. The 42
+# herdr templates on this machine declare `command = "omp-pane"`, which makes
+# the wrapper the pane's DIRECT child — exiting there ends the pane, and a
+# one-pane workspace closes with it. That is how 13 panes and 8 workspaces
+# disappeared on 2026-09-03 when a revival sweep started wrappers over sessions
+# they could not resolve.
+#
+# So: exit when an interactive login shell is our parent — that lands the user
+# back on the prompt they already had. Become the shell otherwise. The test is
+# argv[0], not the executable name: a login shell is `-zsh`, and `ps -o comm=`
+# strips exactly the dash that carries the answer (all 62 wrappers on this
+# machine read `zsh` there and `-zsh` here). herdr's own command panes are a
+# separate spawn path that may or may not put `/bin/sh -c` in between, and
+# neither shape wears the dash, so both land on the exec.
+#
+# Guessing wrong is asymmetric, which is why the doubtful case execs: a wrong
+# `exit` ends the pane and can close its workspace, a wrong `exec` costs one
+# nested shell.
+hand_back() {
+	rm -f "$hint" "$frame"
+	case "$(ps -o command= -p "$PPID" 2>/dev/null)" in
+	-*) exit 0 ;;
+	esac
+	exec "${SHELL:-/bin/sh}" -l
+}
+
 run_omp() {
 	# Herdr templates preserve the pane/socket variables but do not set this integration gate on
 	# a resumed wrapper. Without it OMP never reports its session path, so Collie cannot start voice.
 	HERDR_ENV=1 omp "$@"
-	[ -s "$hint" ] || { rm -f "$hint" "$frame"; exit 0; }
+	[ -s "$hint" ] || hand_back
 }
 
 # `--parked`: come up already asleep. The reaper uses this to retrofit a sleep
@@ -174,7 +209,7 @@ while :; do
 
 	# Could not identify our session — behave like plain omp and hand the pane
 	# back to the shell rather than resuming somebody else's conversation.
-	[ -n "$sess" ] && [ -f "$sess" ] || exit 0
+	[ -n "$sess" ] && [ -f "$sess" ] || hand_back
 
 	if [ "$parked" != 1 ]; then
 		# Re-exec once per sleep so a wrapper that has been running for days
@@ -192,7 +227,7 @@ while :; do
 	parked=0
 
 	badge_sleeping
-	omp-frozen "$sess" || { badge_awake; exit 0; }
+	omp-frozen "$sess" || { badge_awake; hand_back; }
 	badge_awake
 
 	started=$(date +%s)
