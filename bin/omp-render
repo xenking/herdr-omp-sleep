@@ -16,25 +16,32 @@
 //
 // Measured: 35 MB / 4605 records / 2871 messages -> 69,445 rows in 2.5s.
 //
-// Usage: omp-render [--md] [--unfold] <session.jsonl> [width]
+// Usage: omp-render [--leaf=<leafId>] [--md] [--unfold] <session.jsonl> [width]
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 
 const argv = process.argv.slice(2);
 let markdown = false;
 let unfold = false;
+let leaf: string | undefined;
 while (argv.length > 0 && argv[0]?.startsWith("--") === true) {
-	const flag = argv.shift();
+	const flag = argv.shift()!;
 	if (flag === "--md") markdown = true;
 	else if (flag === "--unfold") unfold = true;
-	else {
+	else if (flag.startsWith("--leaf=")) {
+		leaf = flag.slice("--leaf=".length);
+		if (leaf.length === 0) {
+			console.error("omp-render: --leaf requires a value");
+			process.exit(2);
+		}
+	} else {
 		console.error(`omp-render: unknown flag ${flag}`);
 		process.exit(2);
 	}
 }
 const sess: string | undefined = argv[0];
 if (sess === undefined || !existsSync(sess)) {
-	console.error("usage: omp-render [--md] [--unfold] <session.jsonl> [width]");
+	console.error("usage: omp-render [--leaf=<leafId>] [--md] [--unfold] <session.jsonl> [width]");
 	process.exit(2);
 }
 // Same resolution omp's gallery CLI uses (cli/gallery-cli.ts:181): a requested
@@ -54,7 +61,7 @@ if (!existsSync(src)) {
 
 interface Entry {
 	id?: string;
-	parentId?: string;
+	parentId?: string | null;
 	type?: string;
 	message?: unknown;
 }
@@ -73,31 +80,68 @@ if (entries.length === 0) {
 	process.exit(4);
 }
 
-// Sleeping can fork the session tree, and a fork leaves dead siblings in the
-// file. Walk parentId back from the newest record so the render shows the same
-// branch omp would resume onto, not every abandoned turn.
 const byId = new Map<string, Entry>();
 for (const entry of entries) {
 	if (entry.id !== undefined) byId.set(entry.id, entry);
 }
-const branch: Entry[] = [];
-const seen = new Set<string>();
-let cursor: Entry | undefined = entries[entries.length - 1];
-while (cursor !== undefined) {
-	branch.push(cursor);
-	const parent: string | undefined = cursor.parentId;
-	if (parent === undefined || seen.has(parent)) break;
-	seen.add(parent);
-	cursor = byId.get(parent);
-}
-branch.reverse();
 
-// A walk that reaches almost nothing is a broken or unlinked file, not a
-// one-message conversation: an interrupted write, a hand-made session, an older
-// record shape without parentId. Silently rendering the tip of such a file is
-// the failure this script exists to prevent, so fall back to file order — a
-// fork's dead sibling is a smaller lie than a lost conversation.
-const selected = branch.length >= entries.length * 0.6 ? branch : entries;
+const treeEntries = entries.filter(entry => entry.id !== undefined && entry.type !== "session");
+const walkFrom = (start: Entry): Entry[] => {
+	const branch: Entry[] = [];
+	const seen = new Set<string>();
+	let cursor: Entry | undefined = start;
+	while (cursor !== undefined) {
+		const id = cursor.id;
+		if (id === undefined) {
+			console.error("omp-render: ancestry entry is missing an id");
+			process.exit(4);
+		}
+		if (seen.has(id)) {
+			console.error(`omp-render: cycle in ancestry at ${id}`);
+			process.exit(4);
+		}
+		seen.add(id);
+		branch.push(cursor);
+		if (cursor.parentId === undefined || cursor.parentId === null) break;
+		const parent = byId.get(cursor.parentId);
+		if (parent === undefined) {
+			console.error(`omp-render: missing ancestry ${cursor.parentId} for ${id}`);
+			process.exit(4);
+		}
+		cursor = parent;
+	}
+	branch.reverse();
+	return branch;
+};
+
+let selected: Entry[];
+if (leaf !== undefined) {
+	const start = byId.get(leaf);
+	if (start === undefined) {
+		console.error(`omp-render: leaf not found: ${leaf}`);
+		process.exit(4);
+	}
+	selected = walkFrom(start);
+} else if (treeEntries.length === 0) {
+	// Legacy files without tree ids have no branch information to disambiguate.
+	selected = entries;
+} else {
+	const childIds = new Set<string>();
+	for (const entry of treeEntries) {
+		if (entry.parentId !== undefined && entry.parentId !== null) childIds.add(entry.parentId);
+	}
+	const tips = treeEntries.filter(entry => entry.id !== undefined && !childIds.has(entry.id));
+	if (tips.length !== 1) {
+		console.error(`omp-render: leaf required (${tips.length === 0 ? "no tip" : "multiple tips"})`);
+		process.exit(4);
+	}
+	selected = walkFrom(tips[0]!);
+	if (selected.length !== treeEntries.length) {
+		console.error("omp-render: session tree is not an unambiguous single chain");
+		process.exit(4);
+	}
+}
+
 const messageEntries = selected.filter(entry => entry.type === "message" && entry.message !== undefined);
 
 if (markdown) {

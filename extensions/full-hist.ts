@@ -6,8 +6,8 @@
 // (which is what an extension gets) it splits the herdr pane and pages there,
 // so tens of thousands of rows never enter the agent's context.
 //
-// All session resolution lives in omp-hist — it asks herdr which session this
-// pane is running — so this command carries no path logic of its own.
+// The command supplies the live file and leaf; Herdr's file-only report cannot
+// distinguish two panes on different branches of one journal.
 import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 
 export default function fullHist(pi: ExtensionAPI) {
@@ -18,7 +18,13 @@ export default function fullHist(pi: ExtensionAPI) {
 				ctx.ui.notify("full-hist: not in a herdr pane — run `omp-hist` in a terminal", "error");
 				return;
 			}
-			const proc = Bun.spawn(["omp-hist"], { stdout: "pipe", stderr: "pipe" });
+			const file = ctx.sessionManager.getSessionFile();
+			const leaf = ctx.sessionManager.getLeafId();
+			if (!file || !leaf) {
+				ctx.ui.notify("full-hist: no selected conversation history", "info");
+				return;
+			}
+			const proc = Bun.spawn(["omp-hist", file, leaf], { stdout: "pipe", stderr: "pipe" });
 			const [code, err] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
 			if (code !== 0) {
 				ctx.ui.notify(`full-hist: ${err.trim() || `omp-hist exited ${code}`}`, "error");

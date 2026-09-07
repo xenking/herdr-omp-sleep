@@ -17,7 +17,7 @@ DO_TEMPLATES=0
 DO_UNINSTALL=0
 
 SCRIPTS=(omp-pane omp-frozen omp-render omp-hist omp-reap-idle)
-EXTENSIONS=(draft-keeper.ts full-hist.ts)
+EXTENSIONS=(draft-keeper.ts full-hist.ts sleep-state.ts)
 
 # The launchd timer cannot cover a herdr restart. Its interval runs from load,
 # so after a reboot the first sweep lands up to 15 minutes after herdr has
@@ -217,8 +217,9 @@ esac
 
 cat <<EOF
 
-Done. Panes already running plain omp are picked up on their first sleep;
-nothing needs restarting.
+Done. New OMP processes load sleep-state.ts. Existing processes without its
+snapshot stay awake; cursorless old parked panes are not revived to a guessed branch.
+Preserve/select the intended branch before restarting an old shared-file session.
 
 Verify — what would sleep right now, without touching anything:
   DRY_RUN=1 IDLE_MIN=0 $PREFIX/omp-reap-idle

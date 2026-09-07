@@ -22,6 +22,8 @@
 set -euo pipefail
 
 arg=${1:-${HERDR_PANE_ID:-}}
+leaf=${2:-}
+state_dir="${PI_CODING_AGENT_DIR:-$HOME/.omp/agent}/frozen"
 [ -n "$arg" ] || { echo "usage: omp-hist [pane-id | session.jsonl]" >&2; exit 2; }
 
 case $arg in
@@ -29,15 +31,25 @@ case $arg in
 	sess=$arg
 	;;
 *)
-	# A live pane reports its session to herdr. A parked one does not — the
-	# agent leaves `agent list` when omp dies — so fall back to the reaper's
-	# hint file and then to its log.
-	sess=$(herdr agent list 2>/dev/null |
-		jq -r --arg p "$arg" '.result.agents[]? | select(.pane_id == $p)
-			| .agent_session.value // empty' | head -1) || sess=
-	[ -n "$sess" ] || sess=$(cat "$HOME/.omp/agent/frozen/$arg.session" 2>/dev/null || true)
-	[ -n "$sess" ] || sess=$(grep " slept $arg " "$HOME/.local/state/omp-reap.log" 2>/dev/null |
-		tail -1 | sed -E 's/.*resume=//')
+	pids=$(herdr pane process-info --pane "$arg" 2>/dev/null |
+		jq -r '.result.process_info.foreground_processes[]?
+			| select(.cmdline | test("bin/omp(\\s|$)")) | .pid') || pids=
+	sess=
+	for pid in $pids; do
+		record="$state_dir/$arg.live.$pid.json"
+		[ -s "$record" ] || continue
+		jq -e --argjson pid "$pid" '.version == 1 and .pid == $pid and (.leafId | type == "string")' "$record" >/dev/null || continue
+		sess=$(jq -r '.sessionFile' "$record")
+		leaf=$(jq -r '.leafId' "$record")
+		break
+	done
+	if [ -z "$sess" ] && [ -z "$pids" ]; then
+		record="$state_dir/$arg.cursor.json"
+		if [ -s "$record" ] && jq -e '.version == 1 and .checkpointed == true' "$record" >/dev/null; then
+			sess=$(jq -r '.sessionFile' "$record")
+			leaf=$(jq -r '.leafId' "$record")
+		fi
+	fi
 	;;
 esac
 
@@ -67,8 +79,8 @@ if [ -t 1 ]; then
 		size=$(stty size </dev/tty 2>/dev/null || true)
 		cols=${size##* }
 		[ -n "$cols" ] || cols=$(tput cols 2>/dev/null || echo 100)
-		omp-render "$sess" "$cols" >"$fold_view"
-		omp-render --unfold "$sess" "$cols" >"$full_view"
+		omp-render ${leaf:+"--leaf=$leaf"} "$sess" "$cols" >"$fold_view"
+		omp-render --unfold ${leaf:+"--leaf=$leaf"} "$sess" "$cols" >"$full_view"
 		# less truncates its prompt at the screen width, so the legend is
 		# sized to the pane: see the same two tiers in omp-frozen.
 		if [ "$cols" -ge 100 ]; then
@@ -110,5 +122,5 @@ for _ in 1 2 3 4 5 6 7 8; do
 	sleep 0.5
 	herdr pane read "$new" --source visible 2>/dev/null | grep -q '[^[:space:]]' && break
 done
-herdr pane run "$new" "$self" "$sess" >/dev/null 2>&1 || true
+herdr pane run "$new" "$self" "$sess" ${leaf:+"$leaf"} >/dev/null 2>&1 || true
 printf 'full history (%s) opened in pane %s\n' "$(basename "$sess")" "$new"
