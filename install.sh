@@ -19,6 +19,16 @@ DO_UNINSTALL=0
 SCRIPTS=(omp-pane omp-frozen omp-render omp-hist omp-reap-idle)
 EXTENSIONS=(draft-keeper.ts full-hist.ts)
 
+# The launchd timer cannot cover a herdr restart. Its interval runs from load,
+# so after a reboot the first sweep lands up to 15 minutes after herdr has
+# already restored every pane as a bare shell — measured at 22 minutes on
+# 2026-09-03, long after the human went looking for their sessions. A plugin
+# `[[startup]]` hook fires exactly once "after Herdr restores the session and
+# its API socket is ready" (herdr 0.7.5+), and again when a new server takes
+# over during live handoff, which is the other case that strands panes.
+PLUGIN_ID="omp-sleep"
+PLUGIN_DIR="$STATE_DIR/omp-sleep-herdr-plugin"
+
 die() {
 	printf 'error: %s\n' "$1" >&2
 	exit 1
@@ -70,6 +80,9 @@ if [ "$DO_UNINSTALL" = 1 ]; then
 	launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
 	rm -f "$PLIST"
 	printf 'removed  %s\n' "$PLIST"
+	herdr plugin unlink "$PLUGIN_ID" >/dev/null 2>&1 || true
+	rm -rf "$PLUGIN_DIR"
+	printf 'removed  %s (herdr plugin %s)\n' "$PLUGIN_DIR" "$PLUGIN_ID"
 	for s in "${SCRIPTS[@]}"; do
 		rm -f "$PREFIX/$s"
 		printf 'removed  %s\n' "$PREFIX/$s"
@@ -145,6 +158,30 @@ printf 'installed  %s\n' "$PLIST"
 launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
 launchctl bootstrap "$DOMAIN" "$PLIST"
 printf 'loaded     %s (every 900s, IDLE_MIN=%s)\n' "$LABEL" "$IDLE_MIN"
+
+# Absolute path, not a bare name: the hook inherits whatever PATH the herdr
+# server was started with, and a server launched from anywhere but an
+# interactive shell would not have $PREFIX on it.
+mkdir -p "$PLUGIN_DIR"
+cat >"$PLUGIN_DIR/herdr-plugin.toml" <<EOF
+id = "$PLUGIN_ID"
+name = "omp sleep revival"
+version = "0.1.0"
+min_herdr_version = "0.7.5"
+description = "Restore parked omp panes to their frozen view after a herdr restart or handoff."
+platforms = ["macos"]
+
+[[startup]]
+command = ["$PREFIX/omp-reap-idle"]
+EOF
+printf 'installed  %s\n' "$PLUGIN_DIR/herdr-plugin.toml"
+
+if herdr plugin link "$PLUGIN_DIR" >/dev/null 2>&1; then
+	printf 'linked     herdr plugin %s (revives parked panes on herdr start)\n' "$PLUGIN_ID"
+else
+	printf 'warning    could not link herdr plugin %s; run: herdr plugin link %s\n' \
+		"$PLUGIN_ID" "$PLUGIN_DIR" >&2
+fi
 
 # The script's own default has to match the plist, or a manual run acts on a
 # different set of panes than the scheduled one and every diagnosis is wrong.
