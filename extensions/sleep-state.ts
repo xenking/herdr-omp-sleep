@@ -11,6 +11,11 @@ interface Position {
   hasMessages: boolean;
   updatedAt: number;
   checkpointed?: boolean;
+  runtime: {
+    kind: "omp" | "omp-exp";
+    command: string[];
+    env: Record<string, string>;
+  };
 }
 
 export default function sleepState(pi: ExtensionAPI) {
@@ -27,6 +32,15 @@ export default function sleepState(pi: ExtensionAPI) {
   let polling = false;
   let hasMessages = false;
   const askUIs = new WeakSet<object>();
+  const runtime: Position["runtime"] = {
+    kind: process.env.OMP_EXP_LAUNCHER ? "omp-exp" : "omp",
+    command: [process.execPath, ...process.execArgv, process.argv[1]],
+    env: {},
+  };
+  for (const key of ["PATH", "PI_CONFIG_FILES", "PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR", "OMP_EXP_LAUNCHER"]) {
+    const value = process.env[key];
+    if (value !== undefined) runtime.env[key] = value;
+  }
 
   const atomicWrite = (file: string, text: string) => {
     mkdirSync(dir, { recursive: true });
@@ -39,7 +53,7 @@ export default function sleepState(pi: ExtensionAPI) {
     const sessionFile = ctx.sessionManager.getSessionFile();
     const sessionId = ctx.sessionManager.getSessionId();
     if (!sessionFile || !isAbsolute(sessionFile) || !sessionId) return;
-    return { version: 1, pid: process.pid, sessionFile, sessionId, leafId: ctx.sessionManager.getLeafId(), hasMessages, updatedAt: Date.now() };
+    return { version: 1, pid: process.pid, sessionFile, sessionId, leafId: ctx.sessionManager.getLeafId(), hasMessages, updatedAt: Date.now(), runtime };
   };
   let openAsks = 0;
   const acknowledge = (ctx: ExtensionContext) => {

@@ -148,6 +148,9 @@ load_checkpoint() {
 		and (.sessionId | type == "string" and length > 0)
 		and (.leafId | type == "string" and length > 0)
 		and (.updatedAt | type == "number" and . > 0)
+		and (.runtime.command | type == "array" and length >= 2 and all(.[]; type == "string" and length > 0))
+		and (.runtime.command[0] | startswith("/"))
+		and (.runtime.env | type == "object" and all(.[]; type == "string"))
 	' "$cursor" >/dev/null 2>&1 || return 1
 	checkpoint_pid=$(jq -er '.pid | tostring' "$cursor" 2>/dev/null) || return 1
 	checkpoint_session=$(jq -er '.sessionFile' "$cursor" 2>/dev/null) || return 1
@@ -204,10 +207,17 @@ run_omp() {
 }
 
 run_omp_resume() {
-	local sess=$1 leaf=$2 session_id=$3
-	HERDR_ENV=1 OMP_SLEEP_RESUME_SESSION="$session_id" \
+	local sess=$1 leaf=$2 session_id=$3 value
+	local -a runtime_command=() runtime_env=()
+	while IFS= read -r -d '' value; do runtime_command+=("$value"); done \
+		< <(jq -j '.runtime.command[] | ., "\u0000"' "$cursor")
+	while IFS= read -r -d '' value; do runtime_env+=("$value"); done \
+		< <(jq -j '.runtime.env | to_entries[] | "\(.key)=\(.value)", "\u0000"' "$cursor")
+	env -u PATH -u PI_CONFIG_FILES -u PI_CODING_AGENT_DIR \
+		-u PI_CODING_AGENT_SESSION_DIR -u OMP_EXP_LAUNCHER \
+		"${runtime_env[@]}" HERDR_ENV=1 OMP_SLEEP_RESUME_SESSION="$session_id" \
 		OMP_SLEEP_RESUME_LEAF="$leaf" \
-		omp --resume="$sess" -e "$agent_dir/extensions/sleep-state.ts" \
+		"${runtime_command[@]}" --resume="$sess" -e "$agent_dir/extensions/sleep-state.ts" \
 		/omp-sleep-resume
 	[ -s "$hint" ] || hand_back
 }

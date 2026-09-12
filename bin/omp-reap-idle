@@ -190,6 +190,9 @@ load_live_snapshot() {
 		and ((.leafId == null) or (.leafId | type == "string" and length > 0))
 		and ((.updatedAt | type) == "number")
 		and (.updatedAt <= $now and ($now - .updatedAt) <= $max)
+		and (.runtime.command | type == "array" and length >= 2 and all(.[]; type == "string" and length > 0))
+		and (.runtime.command[0] | startswith("/"))
+		and (.runtime.env | type == "object" and all(.[]; type == "string"))
 	' "$file" >/dev/null 2>&1 || return 1
 	live_session=$(jq -er '.sessionFile' "$file" 2>/dev/null) || return 1
 	live_session_id=$(jq -er '.sessionId' "$file" 2>/dev/null) || return 1
@@ -214,6 +217,9 @@ load_cursor() {
 		and (.sessionId | type == "string" and length > 0)
 		and (.leafId | type == "string" and length > 0)
 		and (.updatedAt | type == "number" and . > 0)
+		and (.runtime.command | type == "array" and length >= 2 and all(.[]; type == "string" and length > 0))
+		and (.runtime.command[0] | startswith("/"))
+		and (.runtime.env | type == "object" and all(.[]; type == "string"))
 	' "$file" >/dev/null 2>&1 || return 1
 	cursor_session=$(jq -er '.sessionFile' "$file" 2>/dev/null) || return 1
 	cursor_session_id=$(jq -er '.sessionId' "$file" 2>/dev/null) || return 1
