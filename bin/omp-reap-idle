@@ -315,6 +315,10 @@ printf '%s' "$pinfo" | jq -e '.result.process_info.foreground_processes[]?
 # load_live_snapshot below is the real identity gate; the command line and
 # herdr's reported session are deliberately ignored, since either can name
 # a sibling or the pre-fork session.
+pid=
+sess=
+session_id=
+leaf=
 for candidate_pid in $(printf '%s' "$pinfo" |
 	jq -r '.result.process_info.foreground_processes[]?
 		| select(.cmdline | test("(^|/)omp(\\s|$)")) | .pid'); do
