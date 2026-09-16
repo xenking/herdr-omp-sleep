@@ -20,13 +20,29 @@
 #      fixture put a real work pane to sleep as a side effect (2026-08-07).
 set -euo pipefail
 
-# Default matches EnvironmentVariables.IDLE_MIN in the launchd plist, so a
-# manual run shows the same panes the scheduled one acts on.
+# Default matches IDLE_MIN in the scheduler entry (launchd plist on macOS,
+# systemd unit on Linux), so a manual run shows the same panes the scheduled
+# one acts on.
 IDLE_MIN=${IDLE_MIN:-15}
 EMPTY_MIN=${EMPTY_MIN:-$((IDLE_MIN * 4))}
 
 ONLY=""
 [ "${1:-}" = --pane ] && ONLY=${2:?usage: omp-reap-idle [--pane <id>]}
+OS=$(uname -s)
+
+# Portable file times and hashes: BSD stat(1) on macOS (`stat -f %m`/`%z`)
+# and `shasum`; GNU stat(1) on Linux (`stat -c %Y`/`%s`) and `sha256sum`.
+# Every clock in this script goes through these so neither backend drifts.
+file_mtime() {
+	if [ "$OS" = Darwin ]; then stat -f %m "$1"; else stat -c %Y "$1"; fi
+}
+file_size() {
+	if [ "$OS" = Darwin ]; then stat -f %z "$1"; else stat -c %s "$1"; fi
+}
+sha256_stdin() {
+	if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1
+	else shasum -a 256 | cut -d' ' -f1; fi
+}
 
 # The extension and both transport scripts share this state root. The live
 # file is per PID; `.session` remains a plain legacy park marker.
@@ -273,7 +289,7 @@ while IFS=$'\t' read -r pane sess; do
 	# Checked first: a pane can hold a draft before it has a session file.
 	draft="$FROZEN_DIR/$pane.draft"
 	if [ -s "$draft" ]; then
-		why="$pane unsent draft ($(stat -f %z "$draft") bytes), left awake"
+		why="$pane unsent draft ($(file_size "$draft") bytes), left awake"
 		if [ "${DRY_RUN:-0}" = 1 ]; then
 			printf 'skip %s\n' "$why"
 		else
@@ -291,16 +307,21 @@ wrapped=1
 printf '%s' "$pinfo" | jq -e '.result.process_info.foreground_processes[]?
 	| select(.cmdline | test("omp-pane"))' >/dev/null 2>&1 || wrapped=0
 
-# Target an exact omp PID and its matching, fresh root-TUI snapshot. The
-# command line and herdr's reported session are deliberately ignored:
-# either can name a sibling or the pre-fork session.
+# Target an exact omp PID and its matching, fresh root-TUI snapshot.
+# Basename match, not path match: herdr on Linux reports a bare `omp`
+# cmdline with no `bin/` prefix, macOS reports the full path. `(^|/)omp`
+# followed by whitespace or end covers both and still excludes omp-pane,
+# omp-frozen, omp-render, omp-hist and omp-reap-idle. Enumeration only —
+# load_live_snapshot below is the real identity gate; the command line and
+# herdr's reported session are deliberately ignored, since either can name
+# a sibling or the pre-fork session.
 pid=
 sess=
 session_id=
 leaf=
 for candidate_pid in $(printf '%s' "$pinfo" |
 	jq -r '.result.process_info.foreground_processes[]?
-		| select(.cmdline | test("bin/omp(\\s|$)")) | .pid'); do
+		| select(.cmdline | test("(^|/)omp(\\s|$)")) | .pid'); do
 	valid_pid "$candidate_pid" || continue
 	if load_live_snapshot "$pane" "$candidate_pid"; then
 		pid=$candidate_pid
@@ -316,7 +337,7 @@ done
 # (idleTimeoutSeconds=300) appends without adding a user turn, so the turn
 # clock below cannot see it. If the file moved in the last minute, leave
 # this pane alone and catch it next tick — never SIGTERM mid-compaction.
-if [ -f "$sess" ] && [ $((now - $(stat -f %m "$sess"))) -lt 60 ]; then
+if [ -f "$sess" ] && [ $((now - $(file_mtime "$sess"))) -lt 60 ]; then
 	continue
 fi
 
@@ -361,7 +382,7 @@ fi
 
 	age=$(idle_minutes "$sess")
 	# No parseable turn in the tail — fall back to the file clock.
-	[ -n "$age" ] || age=$(((now - $(stat -f %m "$sess")) / 60))
+	[ -n "$age" ] || age=$(((now - $(file_mtime "$sess")) / 60))
 	# The turn clock measures the CONVERSATION, not the human. Reading a woken
 	# pane — paging the session tree, scrolling back — writes no turn, so a
 	# session resumed after a night away reads as `idle=1107m` and goes
@@ -442,11 +463,11 @@ fi
 		sleep 0.5
 		printf '%s' "$(herdr pane process-info --pane "$pane" 2>/dev/null)" \
 			| jq -e '.result.process_info.foreground_processes[]?
-				| select(.cmdline | test("bin/omp(\\s|$)"))' >/dev/null 2>&1 || break
+				| select(.cmdline | test("(^|/)omp(\\s|$)"))' >/dev/null 2>&1 || break
 	done
 	if herdr pane process-info --pane "$pane" 2>/dev/null \
 		| jq -e '.result.process_info.foreground_processes[]?
-			| select(.cmdline | test("bin/omp(\\s|$)"))' >/dev/null 2>&1; then
+			| select(.cmdline | test("(^|/)omp(\\s|$)"))' >/dev/null 2>&1; then
 		printf '%s WARN %s omp still alive, left at shell\n' \
 			"$(date +%FT%T)" "$pane" >>"$LOG"
 		continue
@@ -493,7 +514,7 @@ while read -r pane; do
 	pinfo=$(herdr pane process-info --pane "$pane" 2>/dev/null)
 	if [ -z "$label" ] && printf '%s' "$pinfo" |
 		jq -e '.result.process_info.foreground_processes[]?
-			| select(.cmdline | test("bin/omp(\\s|$)"))' >/dev/null 2>&1; then
+			| select(.cmdline | test("(^|/)omp(\\s|$)"))' >/dev/null 2>&1; then
 		if [ "${DRY_RUN:-0}" = 1 ]; then
 			printf 'would claim %s (live omp, no row)\n' "$pane"
 		else
@@ -563,7 +584,7 @@ while read -r pane; do
 	# autolearn, so a pane whose last real turn was hours ago would advertise
 	# itself as minutes old — the exact lie idle_minutes() exists to avoid.
 	mins=$(idle_minutes "$sess") || mins=
-	[ -n "$mins" ] || mins=$(((now - $(stat -f %m "$sess")) / 60))
+	[ -n "$mins" ] || mins=$(((now - $(file_mtime "$sess")) / 60))
 	desc="$(human_minutes "$mins") · $title"
 	if [ "${DRY_RUN:-0}" = 1 ]; then
 		printf 'would label %-8s %s\n' "$pane" "$desc"
@@ -682,7 +703,7 @@ while read -r pane; do
 	[ -n "$spid" ] || continue
 	sage=$(pid_minutes "$spid")
 	[ -n "$sage" ] || sage=0
-	fmtime=$(stat -f %m "$frame" 2>/dev/null) || continue
+	fmtime=$(file_mtime "$frame" 2>/dev/null) || continue
 	fage=$(((now - fmtime) / 60))
 
 	# Use the saved branch checkpoint, never the frame text or the sleep log.
@@ -704,7 +725,7 @@ while read -r pane; do
 	esac
 	got=$(basename "$(dirname "$sess")")
 	if [ "$got" != "$want" ]; then
-		[ "$got" = "${got%-*}-$(printf '%s' "$pcwd" | shasum -a256 | cut -d' ' -f1)" ] || continue
+		[ "$got" = "${got%-*}-$(printf '%s' "$pcwd" | sha256_stdin)" ] || continue
 	fi
 
 	cands="$cands$pane	$sage	$fage	$sess	$leaf

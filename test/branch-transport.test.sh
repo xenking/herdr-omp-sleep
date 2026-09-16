@@ -55,8 +55,8 @@ elif [ "$1 $2" = 'pane process-info' ]; then
   if [ -e "$DEAD" ]; then
     printf '%s\n' '{"result":{"process_info":{"foreground_processes":[]}}}'
   else
-    printf '{"result":{"process_info":{"foreground_processes":[{"pid":%s,"cmdline":"%s/bin/omp --resume=%s"}]}}}\n' \
-      "$TARGET_PID" "$TMP_ROOT" "$OLD_PATH"
+    printf '{"result":{"process_info":{"foreground_processes":[{"pid":%s,"cmdline":"omp"}]}}}\n' \
+      "$TARGET_PID"
   fi
 fi
 EOF
@@ -67,8 +67,9 @@ DEAD="$tmp/dead" STATE="$state" TMP_ROOT="$tmp" OLD_PATH="$old" \
 target_pid=$!
 trap 'kill "$target_pid" 2>/dev/null || true; wait "$target_pid" 2>/dev/null || true; rm -rf "$tmp"' EXIT
 now_ms=$(( $(date +%s) * 1000 ))
+# Fixture mirrors sleep-state.ts: reaper and wrapper require runtime.command/env.
 cat >"$state/p.live.$target_pid.json" <<EOF
-{"version":1,"pid":$target_pid,"sessionFile":"$new","sessionId":"forked","leafId":"leaf-b","updatedAt":$now_ms}
+{"version":1,"pid":$target_pid,"sessionFile":"$new","sessionId":"forked","leafId":"leaf-b","updatedAt":$now_ms,"runtime":{"kind":"omp","command":["$tmp/bin/omp","test-fixture"],"env":{}}}
 EOF
 
 # The live snapshot wins over stale startup argv; TERM follows acknowledgement.

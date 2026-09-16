@@ -63,7 +63,7 @@ This is the trust section: every line below is a guard that actually exists in `
 - Idle age is also floored by omp's own uptime, so waking a pane always buys a full `IDLE_MIN` of reading time. Without that floor, resuming a session whose last turn was last night reads as `idle=1107m` and the next tick puts it straight back to sleep while you page through it — reading writes no turn, so the conversation clock cannot see you.
 - If the session file was written in the last 60 seconds, the pane is left alone — never SIGTERM omp mid-compaction.
 - SIGTERM, never SIGKILL: omp flushes a final record on the way out, which is what keeps the session resumable.
-- It resolves omp's pid by matching `bin/omp` exactly, anchored so `bin/omp-pane` can't match it; if it can't name the process that way, it skips the pane rather than guessing.
+- It resolves omp's pid by matching the `omp` basename, anchored so `omp-pane` can't match it; if it can't name the process that way, it skips the pane rather than guessing.
 
 ## Unsent messages
 
@@ -78,7 +78,7 @@ This is the subtle part, so it gets its own section.
 
 An `omp` opened in a pane and never typed into has no session file at all — omp writes one on the first turn. There is nothing to freeze and nothing to resume, so parking such a pane would leave it on an empty transcript.
 
-Instead the reaper retires it: SIGTERM, and the pane falls back to its shell, free to be reused or closed. Nothing is lost, because nothing was ever said. The clock is omp's own uptime rather than a conversation turn, and the grace period is `EMPTY_MIN` — four times `IDLE_MIN` by default, since a pane sitting at a fresh prompt is plausibly one you are about to type into. `EMPTY_MIN` is read from the environment; to change it for the scheduled run, add it beside `IDLE_MIN` in the launchd plist.
+Instead the reaper retires it: SIGTERM, and the pane falls back to its shell, free to be reused or closed. Nothing is lost, because nothing was ever said. The clock is omp's own uptime rather than a conversation turn, and the grace period is `EMPTY_MIN` — four times `IDLE_MIN` by default, since a pane sitting at a fresh prompt is plausibly one you are about to type into. `EMPTY_MIN` is read from the environment; to change it for the scheduled run, add it beside `IDLE_MIN` in the scheduler entry (launchd plist on macOS, systemd service on Linux).
 
 The draft guard applies here first: a pane with something typed but unsent is left alone even though its session is still empty.
 
@@ -88,8 +88,8 @@ A wrapped empty pane receives an empty `.session` signal and returns to its shel
 
 `install.sh` checks the first two before it installs anything:
 
-- macOS — the reaper is a launchd agent, and the scripts use BSD `stat -f` for file times.
-- `herdr`, `omp`, `bun`, `jq`, `less`, and `nc` on `PATH`. `bun` renders the transcript through omp's own formatter; it ships with omp itself.
+- macOS or Linux — the reaper is a launchd agent on macOS and a systemd user timer on Linux; file times and hashes go through portable helpers (`stat -f`/`stat -c`, `shasum`/`sha256sum`).
+- `herdr`, `omp`, `bun`, `jq`, `less`, and `nc` on `PATH` (`systemctl` too on Linux). `bun` renders the transcript through omp's own formatter; it ships with omp itself.
 
 - OMP with the public `session_tree`, `getLeafId`, `navigateTree`, `askDialog` and managed timer extension APIs (verified with 18.1.11).
 Not version-checked by the installer, but required: herdr 0.8 or newer.
@@ -107,10 +107,10 @@ Options:
 - `--prefix DIR` — where the five scripts land. Default `~/.local/bin`.
 - `--idle-min N` — minutes of inactivity before a pane sleeps. Default `15`. The reaper also derives `EMPTY_MIN` from it: 4×, the grace given to a session with no conversation.
 - `--herdr-templates` — also rewrite existing herdr pane templates from `command = "omp"` to `command = "omp-pane"`, backing up every file it touches and printing the list.
-- `--uninstall` — remove the scripts, the extension and the launchd agent (see [Uninstall](#uninstall)).
+- `--uninstall` — remove the scripts, the extension and the scheduler entry (see [Uninstall](#uninstall)).
 - `-h`, `--help`
 
-This installs the five scripts (`omp-pane`, `omp-frozen`, `omp-render`, `omp-hist`, `omp-reap-idle`) into `--prefix`; two extensions (`draft-keeper.ts`, `full-hist.ts`) into `$PI_CODING_AGENT_DIR/extensions` (default `~/.omp/agent/extensions`); and a launchd agent at `~/Library/LaunchAgents/com.$(id -un).omp-reap-idle.plist`, labelled `com.$(id -un).omp-reap-idle`, that runs the reaper every 900 seconds with `IDLE_MIN` set from `--idle-min` in its environment and stderr logged to `~/.local/state/omp-reap.err`.
+This installs the five scripts (`omp-pane`, `omp-frozen`, `omp-render`, `omp-hist`, `omp-reap-idle`) into `--prefix`; two extensions (`draft-keeper.ts`, `full-hist.ts`) into `$PI_CODING_AGENT_DIR/extensions` (default `~/.omp/agent/extensions`); and a scheduler entry — a launchd agent at `~/Library/LaunchAgents/com.$(id -un).omp-reap-idle.plist` on macOS, a systemd user timer `omp-reap-idle.timer` on Linux — that runs the reaper every 900 seconds with `IDLE_MIN` set from `--idle-min` in its environment and stderr logged to `~/.local/state/omp-reap.err`.
 
 Make sure `--prefix` is on `PATH`: herdr templates launch the bare command name `omp-pane`, and the reaper does the same when it parks a pane that started life as bare `omp`. `install.sh` checks this itself and warns if it isn't.
 
@@ -122,7 +122,7 @@ Nothing needs restarting for panes that are already running plain `omp` — the 
 
 ## Configuration
 
-The only tunable is idle timeout, and the installer keeps two copies of its default in sync. `--idle-min N` writes `N` into `EnvironmentVariables.IDLE_MIN` inside the launchd plist — what the scheduled reaper reads — and, if `N` isn't the built-in `15`, `install.sh` also rewrites the `IDLE_MIN=${IDLE_MIN:-15}` default line inside the installed `omp-reap-idle` itself, with a one-line `sed`. That second step is why running `omp-reap-idle` by hand, with no environment set, inspects exactly the panes the scheduled job would — the manual default and the plist's value are never allowed to drift apart.
+The only tunable is idle timeout, and the installer keeps two copies of its default in sync. `--idle-min N` writes `N` into the scheduler entry — `EnvironmentVariables.IDLE_MIN` in the launchd plist, `Environment=IDLE_MIN=` in the systemd service — and, if `N` isn't the built-in `15`, `install.sh` also rewrites the `IDLE_MIN=${IDLE_MIN:-15}` default line inside the installed `omp-reap-idle` itself, with a one-line `sed`. That second step is why running `omp-reap-idle` by hand, with no environment set, inspects exactly the panes the scheduled job would — the manual default and the scheduler's value are never allowed to drift apart.
 
 ## Verify
 
@@ -148,10 +148,16 @@ tail ~/.local/state/omp-reap.log
 
 Each timestamped line is one of: `slept <pane> pid=<pid> idle=<n>m resume=<path>` for a pane it put to sleep, `skip <pane> unsent draft (<n> bytes), left awake` for one a draft protected, or `WARN <pane> omp still alive, left at shell` for a bare pane that didn't drop to its shell after SIGTERM.
 
-Check the schedule itself:
+Check the schedule itself — macOS:
 
 ```bash
 launchctl print gui/$(id -u)/com.$(id -un).omp-reap-idle | grep -E 'state|runs'
+```
+
+Linux:
+
+```bash
+systemctl --user list-timers omp-reap-idle.timer
 ```
 
 ## Uninstall
@@ -160,11 +166,10 @@ launchctl print gui/$(id -u)/com.$(id -un).omp-reap-idle | grep -E 'state|runs'
 ./install.sh --uninstall
 ```
 
-Removes the five scripts from `--prefix`, both extensions from the extensions directory, and the launchd agent. `~/.omp/agent/frozen/` — session hints, parked markers, rendered views, unsent drafts — is left in place. As the uninstaller itself puts it: "Panes parked right now keep their frozen view until you press ENTER."
+Removes the five scripts from `--prefix`, both extensions from the extensions directory, and the scheduler entry. `~/.omp/agent/frozen/` — session hints, parked markers, rendered views, unsent drafts — is left in place. As the uninstaller itself puts it: "Panes parked right now keep their frozen view until you press ENTER."
 
 ## Limits
 
-- macOS only: the reaper is a launchd agent and the scripts shell out to BSD `stat -f`.
 - herdr panes only: the pane wrapper and the draft extension both key off `HERDR_PANE_ID`, which only exists inside a herdr pane.
 - A pane launched from a herdr template whose `command` is still bare `omp` is not wrapped at birth. It still sleeps — the reaper retrofits the wrapper by parking the pane with `omp-pane --parked` after the kill — but that path needs the pane to fall back to a shell first, and logs `WARN … omp still alive, left at shell` if it doesn't. `--herdr-templates` removes the retrofit by wrapping such panes from the start.
 - Already-running OMP processes cannot acquire a newly installed extension automatically. Until a pane has a fresh `sleep-state.ts` snapshot, the reaper leaves it awake. Do not restart a shared-file branch blindly merely to upgrade it: first preserve/choose the intended branch in OMP.
