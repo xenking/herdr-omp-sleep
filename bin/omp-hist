@@ -33,7 +33,7 @@ case $arg in
 *)
 	pids=$(herdr pane process-info --pane "$arg" 2>/dev/null |
 		jq -r '.result.process_info.foreground_processes[]?
-			| select(.cmdline | test("bin/omp(\\s|$)")) | .pid') || pids=
+			| select(.cmdline | test("(^|/)omp(\\s|$)")) | .pid') || pids=
 	sess=
 	for pid in $pids; do
 		record="$state_dir/$arg.live.$pid.json"

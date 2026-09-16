@@ -307,16 +307,17 @@ wrapped=1
 printf '%s' "$pinfo" | jq -e '.result.process_info.foreground_processes[]?
 	| select(.cmdline | test("omp-pane"))' >/dev/null 2>&1 || wrapped=0
 
-# Target an exact omp PID and its matching, fresh root-TUI snapshot. The
-# command line and herdr's reported session are deliberately ignored:
-# either can name a sibling or the pre-fork session.
-pid=
-sess=
-session_id=
-leaf=
+# Target an exact omp PID and its matching, fresh root-TUI snapshot.
+# Basename match, not path match: herdr on Linux reports a bare `omp`
+# cmdline with no `bin/` prefix, macOS reports the full path. `(^|/)omp`
+# followed by whitespace or end covers both and still excludes omp-pane,
+# omp-frozen, omp-render, omp-hist and omp-reap-idle. Enumeration only —
+# load_live_snapshot below is the real identity gate; the command line and
+# herdr's reported session are deliberately ignored, since either can name
+# a sibling or the pre-fork session.
 for candidate_pid in $(printf '%s' "$pinfo" |
 	jq -r '.result.process_info.foreground_processes[]?
-		| select(.cmdline | test("bin/omp(\\s|$)")) | .pid'); do
+		| select(.cmdline | test("(^|/)omp(\\s|$)")) | .pid'); do
 	valid_pid "$candidate_pid" || continue
 	if load_live_snapshot "$pane" "$candidate_pid"; then
 		pid=$candidate_pid
@@ -458,11 +459,11 @@ fi
 		sleep 0.5
 		printf '%s' "$(herdr pane process-info --pane "$pane" 2>/dev/null)" \
 			| jq -e '.result.process_info.foreground_processes[]?
-				| select(.cmdline | test("bin/omp(\\s|$)"))' >/dev/null 2>&1 || break
+				| select(.cmdline | test("(^|/)omp(\\s|$)"))' >/dev/null 2>&1 || break
 	done
 	if herdr pane process-info --pane "$pane" 2>/dev/null \
 		| jq -e '.result.process_info.foreground_processes[]?
-			| select(.cmdline | test("bin/omp(\\s|$)"))' >/dev/null 2>&1; then
+			| select(.cmdline | test("(^|/)omp(\\s|$)"))' >/dev/null 2>&1; then
 		printf '%s WARN %s omp still alive, left at shell\n' \
 			"$(date +%FT%T)" "$pane" >>"$LOG"
 		continue
@@ -509,7 +510,7 @@ while read -r pane; do
 	pinfo=$(herdr pane process-info --pane "$pane" 2>/dev/null)
 	if [ -z "$label" ] && printf '%s' "$pinfo" |
 		jq -e '.result.process_info.foreground_processes[]?
-			| select(.cmdline | test("bin/omp(\\s|$)"))' >/dev/null 2>&1; then
+			| select(.cmdline | test("(^|/)omp(\\s|$)"))' >/dev/null 2>&1; then
 		if [ "${DRY_RUN:-0}" = 1 ]; then
 			printf 'would claim %s (live omp, no row)\n' "$pane"
 		else

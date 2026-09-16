@@ -63,7 +63,7 @@ This is the trust section: every line below is a guard that actually exists in `
 - Idle age is also floored by omp's own uptime, so waking a pane always buys a full `IDLE_MIN` of reading time. Without that floor, resuming a session whose last turn was last night reads as `idle=1107m` and the next tick puts it straight back to sleep while you page through it — reading writes no turn, so the conversation clock cannot see you.
 - If the session file was written in the last 60 seconds, the pane is left alone — never SIGTERM omp mid-compaction.
 - SIGTERM, never SIGKILL: omp flushes a final record on the way out, which is what keeps the session resumable.
-- It resolves omp's pid by matching `bin/omp` exactly, anchored so `bin/omp-pane` can't match it; if it can't name the process that way, it skips the pane rather than guessing.
+- It resolves omp's pid by matching the `omp` basename, anchored so `omp-pane` can't match it; if it can't name the process that way, it skips the pane rather than guessing.
 
 ## Unsent messages
 

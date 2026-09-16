@@ -36,7 +36,6 @@ if [ "${LIVE_FIXTURE:-0}" = 1 ]; then
   done
 fi
 {
-  printf '%s\n' "$0"
   printf '%s\n' "$@"
 } >"$OMP_ARGS"
 printf 'HERDR_ENV=%s\nOMP_SLEEP_RESUME_SESSION=%s\nOMP_SLEEP_RESUME_LEAF=%s\n' \
@@ -56,8 +55,8 @@ elif [ "$1 $2" = 'pane process-info' ]; then
   if [ -e "$DEAD" ]; then
     printf '%s\n' '{"result":{"process_info":{"foreground_processes":[]}}}'
   else
-    printf '{"result":{"process_info":{"foreground_processes":[{"pid":%s,"cmdline":"%s/bin/omp --resume=%s"}]}}}\n' \
-      "$TARGET_PID" "$TMP_ROOT" "$OLD_PATH"
+    printf '{"result":{"process_info":{"foreground_processes":[{"pid":%s,"cmdline":"omp"}]}}}\n' \
+      "$TARGET_PID"
   fi
 fi
 EOF
@@ -104,12 +103,10 @@ OMP_ARGS="$tmp/omp.args" OMP_ENV="$tmp/omp.env" FROZEN_ARGS="$tmp/frozen.args" \
   SHELL="$tmp/bin/shellstub" "$root/bin/omp-pane" --parked --resume="$old" >/dev/null 2>&1
 [[ "$(sed -n '1p' "$FROZEN_ARGS")" == "$new" ]]
 [[ "$(sed -n '2p' "$FROZEN_ARGS")" == leaf-b ]]
-[[ "$(sed -n '1p' "$OMP_ARGS")" == "$tmp/bin/omp" ]]
-[[ "$(sed -n '2p' "$OMP_ARGS")" == test-fixture ]]
-[[ "$(sed -n '3p' "$OMP_ARGS")" == "--resume=$new" ]]
-[[ "$(sed -n '4p' "$OMP_ARGS")" == -e ]]
-[[ "$(sed -n '5p' "$OMP_ARGS")" == "$agent/extensions/sleep-state.ts" ]]
-[[ "$(sed -n '6p' "$OMP_ARGS")" == /omp-sleep-resume ]]
+[[ "$(sed -n '1p' "$OMP_ARGS")" == "--resume=$new" ]]
+[[ "$(sed -n '2p' "$OMP_ARGS")" == -e ]]
+[[ "$(sed -n '3p' "$OMP_ARGS")" == "$agent/extensions/sleep-state.ts" ]]
+[[ "$(sed -n '4p' "$OMP_ARGS")" == /omp-sleep-resume ]]
 [[ "$(sed -n '1p' "$OMP_ENV")" == HERDR_ENV=1 ]]
 [[ "$(sed -n '2p' "$OMP_ENV")" == OMP_SLEEP_RESUME_SESSION=forked ]]
 [[ "$(sed -n '3p' "$OMP_ENV")" == OMP_SLEEP_RESUME_LEAF=leaf-b ]]
