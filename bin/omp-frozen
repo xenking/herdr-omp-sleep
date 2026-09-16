@@ -13,6 +13,11 @@
 #
 # Usage: omp-frozen <session.jsonl> [leafId]
 set -euo pipefail
+# Portable SHA-256: `shasum` on macOS, `sha256sum` on Linux.
+sha256_stdin() {
+	if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1
+	else shasum -a 256 | cut -d' ' -f1; fi
+}
 
 sess=${1:?usage: omp-frozen <session.jsonl> [leafId]}
 leaf=${2:-}
@@ -23,7 +28,7 @@ cache_dir="${PI_CODING_AGENT_DIR:-$HOME/.omp/agent}/frozen"
 mkdir -p "$cache_dir"
 leaf_key=auto
 if [ -n "$leaf" ]; then
-	leaf_key=$(printf '%s' "$leaf" | shasum -a 256 | cut -d' ' -f1)
+	leaf_key=$(printf '%s' "$leaf" | sha256_stdin)
 fi
 base="$cache_dir/$(basename "${sess%.jsonl}").leaf-$leaf_key"
 

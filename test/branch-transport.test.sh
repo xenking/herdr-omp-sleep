@@ -36,6 +36,7 @@ if [ "${LIVE_FIXTURE:-0}" = 1 ]; then
   done
 fi
 {
+  printf '%s\n' "$0"
   printf '%s\n' "$@"
 } >"$OMP_ARGS"
 printf 'HERDR_ENV=%s\nOMP_SLEEP_RESUME_SESSION=%s\nOMP_SLEEP_RESUME_LEAF=%s\n' \
@@ -67,8 +68,9 @@ DEAD="$tmp/dead" STATE="$state" TMP_ROOT="$tmp" OLD_PATH="$old" \
 target_pid=$!
 trap 'kill "$target_pid" 2>/dev/null || true; wait "$target_pid" 2>/dev/null || true; rm -rf "$tmp"' EXIT
 now_ms=$(( $(date +%s) * 1000 ))
+# Fixture mirrors sleep-state.ts: reaper and wrapper require runtime.command/env.
 cat >"$state/p.live.$target_pid.json" <<EOF
-{"version":1,"pid":$target_pid,"sessionFile":"$new","sessionId":"forked","leafId":"leaf-b","updatedAt":$now_ms}
+{"version":1,"pid":$target_pid,"sessionFile":"$new","sessionId":"forked","leafId":"leaf-b","updatedAt":$now_ms,"runtime":{"kind":"omp","command":["$tmp/bin/omp","test-fixture"],"env":{}}}
 EOF
 
 # The live snapshot wins over stale startup argv; TERM follows acknowledgement.
@@ -102,10 +104,12 @@ OMP_ARGS="$tmp/omp.args" OMP_ENV="$tmp/omp.env" FROZEN_ARGS="$tmp/frozen.args" \
   SHELL="$tmp/bin/shellstub" "$root/bin/omp-pane" --parked --resume="$old" >/dev/null 2>&1
 [[ "$(sed -n '1p' "$FROZEN_ARGS")" == "$new" ]]
 [[ "$(sed -n '2p' "$FROZEN_ARGS")" == leaf-b ]]
-[[ "$(sed -n '1p' "$OMP_ARGS")" == "--resume=$new" ]]
-[[ "$(sed -n '2p' "$OMP_ARGS")" == -e ]]
-[[ "$(sed -n '3p' "$OMP_ARGS")" == "$agent/extensions/sleep-state.ts" ]]
-[[ "$(sed -n '4p' "$OMP_ARGS")" == /omp-sleep-resume ]]
+[[ "$(sed -n '1p' "$OMP_ARGS")" == "$tmp/bin/omp" ]]
+[[ "$(sed -n '2p' "$OMP_ARGS")" == test-fixture ]]
+[[ "$(sed -n '3p' "$OMP_ARGS")" == "--resume=$new" ]]
+[[ "$(sed -n '4p' "$OMP_ARGS")" == -e ]]
+[[ "$(sed -n '5p' "$OMP_ARGS")" == "$agent/extensions/sleep-state.ts" ]]
+[[ "$(sed -n '6p' "$OMP_ARGS")" == /omp-sleep-resume ]]
 [[ "$(sed -n '1p' "$OMP_ENV")" == HERDR_ENV=1 ]]
 [[ "$(sed -n '2p' "$OMP_ENV")" == OMP_SLEEP_RESUME_SESSION=forked ]]
 [[ "$(sed -n '3p' "$OMP_ENV")" == OMP_SLEEP_RESUME_LEAF=leaf-b ]]
