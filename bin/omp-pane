@@ -213,6 +213,16 @@ run_omp_resume() {
 		< <(jq -j '.runtime.command[] | ., "\u0000"' "$cursor")
 	while IFS= read -r -d '' value; do runtime_env+=("$value"); done \
 		< <(jq -j '.runtime.env | to_entries[] | "\(.key)=\(.value)", "\u0000"' "$cursor")
+	# Everything above this line is the pre-sleep copy of this same conversation,
+	# drawn at whatever width the pane had then, and omp redraws the whole
+	# transcript at the width the pane has NOW (measured on 18.2.7). So the old
+	# copy is a duplicate - and the one that looks broken, because a pane that
+	# came back at a different width makes the terminal reflow it: every row is
+	# padded to its render width, so a narrower pane wraps each padded tail onto
+	# a line of its own (the phantom blank lines) and splits long rows mid-word.
+	# Nothing can re-wrap scrollback after the fact, so drop it and let the live
+	# render be the only copy. The session file is untouched either way.
+	printf '\033[H\033[2J\033[3J'
 	env -u PATH -u PI_CONFIG_FILES -u PI_CODING_AGENT_DIR \
 		-u PI_CODING_AGENT_SESSION_DIR -u OMP_EXP_LAUNCHER \
 		"${runtime_env[@]}" HERDR_ENV=1 OMP_SLEEP_RESUME_SESSION="$session_id" \
