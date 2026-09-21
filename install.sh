@@ -162,6 +162,15 @@ printf 'loaded     %s (every 900s, IDLE_MIN=%s)\n' "$LABEL" "$IDLE_MIN"
 # Absolute path, not a bare name: the hook inherits whatever PATH the herdr
 # server was started with, and a server launched from anywhere but an
 # interactive shell would not have $PREFIX on it.
+#
+# Give it an explicit PATH and its own log. On 2026-09-14 this hook exited 1
+# within 0.7s of server start with both streams empty in herdr's plugin log,
+# so there was nothing to diagnose and 48 panes stayed bare shells. The cause
+# is PATH: the hook inherits the server's, and a login shell does not repair
+# it either, because this machine's PATH is set in zsh dotfiles that `bash -l`
+# never reads - so `herdr` itself is not resolvable and every query fails.
+# The short wait is for the API socket, since the hook fires as the server is
+# still coming up.
 mkdir -p "$PLUGIN_DIR"
 cat >"$PLUGIN_DIR/herdr-plugin.toml" <<EOF
 id = "$PLUGIN_ID"
@@ -172,7 +181,7 @@ description = "Restore parked omp panes to their frozen view after a herdr resta
 platforms = ["macos"]
 
 [[startup]]
-command = ["$PREFIX/omp-reap-idle"]
+command = ["/bin/bash", "-c", 'export PATH=$PREFIX:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin; exec >>\$HOME/.local/state/omp-sleep-hook.log 2>&1; echo "=== \$(date +%FT%T) startup hook ==="; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do herdr pane list >/dev/null 2>&1 && break; sleep 1; done; echo "api ready after \${i}s"; exec $PREFIX/omp-reap-idle']
 EOF
 printf 'installed  %s\n' "$PLUGIN_DIR/herdr-plugin.toml"
 
