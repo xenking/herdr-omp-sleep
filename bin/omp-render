@@ -52,12 +52,29 @@ if (sess === undefined || !existsSync(sess)) {
 const requested = Number(argv[1] ?? process.env.COLUMNS ?? process.stdout.columns ?? 100);
 const width = Math.max(40, Math.min(200, Number.isFinite(requested) ? requested : 100));
 
-// Resolved at run time, not baked: an omp upgrade replaces this tree wholesale.
-const src = `${homedir()}/.bun/install/global/node_modules/@oh-my-pi/pi-coding-agent/src`;
-if (!existsSync(src)) {
-	console.error(`omp-render: omp source tree gone (${src})`);
+// Resolved at run time, not baked: an omp upgrade replaces this tree wholesale,
+// and it also moves modules between packages. 18.2.7 lifted the theme and the
+// transcript builder out of pi-coding-agent into pi-tui (`modes/theme/theme.ts`
+// -> `theme/theme.ts`, `modes/components/chat-transcript-builder.ts` ->
+// `chat/chat-transcript-builder.ts`), which broke every frozen-view render with
+// a bare `Cannot find module`. So each import names the layouts it knows and
+// takes the first that exists, across both packages.
+const modules = `${homedir()}/.bun/install/global/node_modules/@oh-my-pi`;
+const roots = [`${modules}/pi-coding-agent/src`, `${modules}/pi-tui/src`];
+if (!roots.some(root => existsSync(root))) {
+	console.error(`omp-render: omp source trees gone (${roots.join(", ")})`);
 	process.exit(3);
 }
+const resolve = (...candidates: string[]): string => {
+	for (const candidate of candidates) {
+		for (const root of roots) {
+			const path = `${root}/${candidate}`;
+			if (existsSync(path)) return path;
+		}
+	}
+	console.error(`omp-render: none of these exist under ${roots.join(" or ")}: ${candidates.join(", ")}`);
+	process.exit(3);
+};
 
 interface Entry {
 	id?: string;
@@ -145,7 +162,7 @@ if (leaf !== undefined) {
 const messageEntries = selected.filter(entry => entry.type === "message" && entry.message !== undefined);
 
 if (markdown) {
-	const { formatSessionDumpText } = (await import(`${src}/session/session-dump-format.ts`)) as {
+	const { formatSessionDumpText } = (await import(resolve("session/session-dump-format.ts"))) as {
 		formatSessionDumpText: (options: { messages: readonly unknown[] }) => string;
 	};
 	process.stdout.write(formatSessionDumpText({ messages: messageEntries.map(entry => entry.message) }));
@@ -154,7 +171,7 @@ if (markdown) {
 
 // Both must run before the components are imported: their constructors read
 // settings and the theme at module scope.
-const { Settings } = (await import(`${src}/config/settings.ts`)) as {
+const { Settings } = (await import(resolve("config/settings.ts"))) as {
 	Settings: {
 		init(options: Record<string, unknown>): Promise<{ get(key: string): unknown }>;
 	};
@@ -164,7 +181,7 @@ const settings = await Settings.init({});
 // initTheme() picks up theme.dark/theme.light through getDefaultTheme, but the
 // symbol preset and colour-blind mode are separate arguments it never reads —
 // so a Nerd-Font setup rendered with ASCII fallbacks until these were passed.
-const { initTheme } = (await import(`${src}/modes/theme/theme.ts`)) as {
+const { initTheme } = (await import(resolve("modes/theme/theme.ts", "theme/theme.ts"))) as {
 	initTheme: (
 		enableWatcher?: boolean,
 		symbolPreset?: unknown,
@@ -181,7 +198,9 @@ await initTheme(
 	settings.get("theme.light"),
 );
 
-const { ChatTranscriptBuilder } = (await import(`${src}/modes/components/chat-transcript-builder.ts`)) as {
+const { ChatTranscriptBuilder } = (await import(
+	resolve("modes/components/chat-transcript-builder.ts", "chat/chat-transcript-builder.ts"),
+)) as {
 	ChatTranscriptBuilder: new (deps: Record<string, unknown>) => {
 		rebuild(entries: readonly unknown[]): void;
 		setExpanded(expanded: boolean): void;
