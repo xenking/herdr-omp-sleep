@@ -33,6 +33,12 @@ ONLY=""
 AGENT_DIR=${PI_CODING_AGENT_DIR:-$HOME/.omp/agent}
 FROZEN_DIR="$AGENT_DIR/frozen"
 LIVE_MAX_AGE_MS=15000
+# How omp shows up in a pane's foreground command line. A pane starts it as
+# `bin/omp`; a wake resumes it through the checkpointed runtime command, which
+# is the interpreter plus the package entry point (`bun …/dist/cli.js`).
+# Matching only `bin/omp` left every pane that woke once unparkable
+# (2026-09-23).
+OMP_CMD_RE='bin/omp(\s|$)|pi-coding-agent/dist/cli\.js(\s|$)'
 
 # Must match badge_label in omp-pane.
 BADGE="omp (sleeping)"
@@ -299,8 +305,8 @@ sess=
 session_id=
 leaf=
 for candidate_pid in $(printf '%s' "$pinfo" |
-	jq -r '.result.process_info.foreground_processes[]?
-		| select(.cmdline | test("bin/omp(\\s|$)")) | .pid'); do
+	jq -r --arg re "$OMP_CMD_RE" '.result.process_info.foreground_processes[]?
+		| select(.cmdline | test($re)) | .pid'); do
 	valid_pid "$candidate_pid" || continue
 	if load_live_snapshot "$pane" "$candidate_pid"; then
 		pid=$candidate_pid
@@ -441,12 +447,12 @@ fi
 	for _ in $(seq 20); do
 		sleep 0.5
 		printf '%s' "$(herdr pane process-info --pane "$pane" 2>/dev/null)" \
-			| jq -e '.result.process_info.foreground_processes[]?
-				| select(.cmdline | test("bin/omp(\\s|$)"))' >/dev/null 2>&1 || break
+			| jq -e --arg re "$OMP_CMD_RE" '.result.process_info.foreground_processes[]?
+				| select(.cmdline | test($re))' >/dev/null 2>&1 || break
 	done
 	if herdr pane process-info --pane "$pane" 2>/dev/null \
-		| jq -e '.result.process_info.foreground_processes[]?
-			| select(.cmdline | test("bin/omp(\\s|$)"))' >/dev/null 2>&1; then
+		| jq -e --arg re "$OMP_CMD_RE" '.result.process_info.foreground_processes[]?
+			| select(.cmdline | test($re))' >/dev/null 2>&1; then
 		printf '%s WARN %s omp still alive, left at shell\n' \
 			"$(date +%FT%T)" "$pane" >>"$LOG"
 		continue
@@ -492,8 +498,8 @@ while read -r pane; do
 	esac
 	pinfo=$(herdr pane process-info --pane "$pane" 2>/dev/null)
 	if [ -z "$label" ] && printf '%s' "$pinfo" |
-		jq -e '.result.process_info.foreground_processes[]?
-			| select(.cmdline | test("bin/omp(\\s|$)"))' >/dev/null 2>&1; then
+		jq -e --arg re "$OMP_CMD_RE" '.result.process_info.foreground_processes[]?
+			| select(.cmdline | test($re))' >/dev/null 2>&1; then
 		if [ "${DRY_RUN:-0}" = 1 ]; then
 			printf 'would claim %s (live omp, no row)\n' "$pane"
 		else
