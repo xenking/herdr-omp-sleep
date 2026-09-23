@@ -290,13 +290,6 @@ while IFS=$'\t' read -r pane sess; do
 
 pinfo=$(herdr pane process-info --pane "$pane" 2>/dev/null)
 
-# Was this pane launched through the wrapper? If yes it catches the exit
-# itself. If no — omp IS the pane's command, and killing it drops the pane
-# to its shell; we retrofit the wrapper after the kill below.
-wrapped=1
-printf '%s' "$pinfo" | jq -e '.result.process_info.foreground_processes[]?
-	| select(.cmdline | test("omp-pane"))' >/dev/null 2>&1 || wrapped=0
-
 # Target an exact omp PID and its matching, fresh root-TUI snapshot. The
 # command line and herdr's reported session are deliberately ignored:
 # either can name a sibling or the pre-fork session.
@@ -317,6 +310,16 @@ for candidate_pid in $(printf '%s' "$pinfo" |
 	fi
 done
 [ -n "$pid" ] || continue
+
+# Was this pane launched through the wrapper? If yes it catches the exit
+# itself. If no — omp IS the pane's command, and killing it drops the pane
+# to its shell; we retrofit the wrapper after the kill below. Asked of omp's
+# parent: a current wrapper runs omp as its own foreground job, so the
+# wrapper is no longer among the pane's foreground processes.
+wrapped=0
+case "$(ps -o command= -p "$(ps -o ppid= -p "$pid" | tr -d ' ')" 2>/dev/null)" in
+*omp-pane*) wrapped=1 ;;
+esac
 
 # Is something still WRITING to the session? Idle compaction
 # (idleTimeoutSeconds=300) appends without adding a user turn, so the turn
