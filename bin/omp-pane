@@ -249,7 +249,7 @@ run_omp_resume() {
 resume_exec() (
 	unset PATH PI_CONFIG_FILES PI_CODING_AGENT_DIR PI_CODING_AGENT_SESSION_DIR OMP_EXP_LAUNCHER
 	[ ${#runtime_env[@]} = 0 ] || export "${runtime_env[@]}"
-	export HERDR_ENV=1 OMP_SLEEP_RESUME_SESSION="$3" OMP_SLEEP_RESUME_LEAF="$2"
+	export HERDR_ENV=1 HERDR_AGENT=omp OMP_SLEEP_RESUME_SESSION="$3" OMP_SLEEP_RESUME_LEAF="$2"
 	exec -a omp "${runtime_command[@]}" --resume="$1" -e "$agent_dir/extensions/sleep-state.ts" \
 		/omp-sleep-resume
 )
