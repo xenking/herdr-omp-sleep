@@ -172,11 +172,21 @@ if (markdown) {
 // Both must run before the components are imported: their constructors read
 // settings and the theme at module scope.
 const { Settings } = (await import(resolve("config/settings.ts"))) as {
-	Settings: {
-		init(options: Record<string, unknown>): Promise<{ get(key: string): unknown }>;
-	};
+	Settings: { init(options: Record<string, unknown>): Promise<unknown> };
 };
 const settings = await Settings.init({});
+// 18.4 dropped `settings.get(key)`: values are read through the registered
+// handle, `cfgX.get(settings)`, exported next to the TUI's own settings.
+// Keep the old path for installs that still have it.
+type Handle = { get(scope: unknown): unknown };
+const legacy = (settings as { get?: (key: string) => unknown }).get;
+let setting: (key: string, handle: string) => Promise<unknown>;
+if (typeof legacy === "function") {
+	setting = async key => legacy.call(settings, key);
+} else {
+	const handles = (await import(resolve("modes/settings.ts"))) as Record<string, Handle>;
+	setting = async (_key, handle) => handles[handle]?.get(settings);
+}
 // Exactly the call omp's own gallery CLI makes (cli/gallery-cli.ts:233). A bare
 // initTheme() picks up theme.dark/theme.light through getDefaultTheme, but the
 // symbol preset and colour-blind mode are separate arguments it never reads —
@@ -192,10 +202,10 @@ const { initTheme } = (await import(resolve("modes/theme/theme.ts", "theme/theme
 };
 await initTheme(
 	false,
-	settings.get("symbolPreset"),
-	settings.get("colorBlindMode"),
-	settings.get("theme.dark"),
-	settings.get("theme.light"),
+	await setting("symbolPreset", "cfgSymbolPreset"),
+	await setting("colorBlindMode", "cfgColorBlindMode"),
+	await setting("theme.dark", "cfgThemeDark"),
+	await setting("theme.light", "cfgThemeLight"),
 );
 
 const { ChatTranscriptBuilder } = (await import(
