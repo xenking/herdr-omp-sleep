@@ -18,6 +18,13 @@ rendered_a=$("$root/bin/omp-render" --md --leaf=a "$session")
 [[ "$rendered_a" == *branch-A-only* ]] || { printf 'requested branch missing\n' >&2; exit 1; }
 [[ "$rendered_a" != *branch-B-only* ]] || { printf 'requested branch included sibling\n' >&2; exit 1; }
 
+# Exercise the real frozen-view renderer, not only --md (which bypasses settings/theme).
+native_a=$("$root/bin/omp-render" --leaf=a "$session" 80)
+[[ "$native_a" == *branch-A-only* && "$native_a" != *branch-B-only* ]] || {
+	printf 'native branch render lost the requested conversation\n' >&2
+	exit 1
+}
+
 rendered_b=$("$root/bin/omp-render" --md --leaf=b "$session")
 [[ "$rendered_b" == *branch-B-only* ]] || { printf 'second branch missing\n' >&2; exit 1; }
 [[ "$rendered_b" != *branch-A-only* ]] || { printf 'second branch included sibling\n' >&2; exit 1; }

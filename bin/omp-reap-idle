@@ -481,10 +481,9 @@ done < <(herdr agent list | jq -r --argjson p "$(herdr pane list)" '
 # bash froze at exec (a long-lived wrapper never re-execs, so it can never grow
 # a fix):
 #
-#  - parked but not wearing the badge — the pane sleeps while herdr still shows
-#    the dead session's green `omp`. Cannot mislabel a live pane: a running
-#    omp's own hook outranks this source, so the badge only shows once omp is
-#    gone.
+#  - parked but not wearing the display badge — the pane sleeps while herdr
+#    still shows a live OMP status. The wrapper retains OMP's session identity
+#    and reports unknown state, with `omp (sleeping)` as display-only metadata.
 #  - live omp with NO row at all — a pre-2026-08-17 body still releases the
 #    pane on wake, and nothing repaints an edge-triggered row until omp's next
 #    state change, which a long turn defers indefinitely (wD:p1D).
@@ -492,15 +491,13 @@ badger=$(command -v "$(dirname "$0")/omp-pane" 2>/dev/null || command -v omp-pan
 [ "$slept" = 0 ] || sleep 2 # give a pane just killed a moment to reach its pager
 labels=$(herdr agent list | jq -r '.result.agents[]? | "\(.pane_id)\t\(.agent)"')
 panes_json=$(herdr pane list)
+parked_panes=
 while read -r pane; do
 	[ -n "$pane" ] && [ -n "$badger" ] || continue
 	[ -z "$ONLY" ] || [ "$pane" = "$ONLY" ] || continue
 	label=$(printf '%s' "$labels" | awk -F'\t' -v p="$pane" '$1 == p { print $2 }')
-	case $label in
-	"$BADGE") continue ;;
-	esac
 	pinfo=$(herdr pane process-info --pane "$pane" 2>/dev/null)
-	if [ -z "$label" ] && printf '%s' "$pinfo" |
+	if { [ -z "$label" ] || [ "$label" = "$BADGE" ]; } && printf '%s' "$pinfo" |
 		jq -e --arg re "$OMP_CMD_RE" '.result.process_info.foreground_processes[]?
 			| select(.cmdline | test($re))' >/dev/null 2>&1; then
 		if [ "${DRY_RUN:-0}" = 1 ]; then
@@ -516,6 +513,8 @@ while read -r pane; do
 	printf '%s' "$pinfo" |
 		jq -e '.result.process_info.foreground_processes[]?
 			| select(.cmdline | test("omp-frozen"))' >/dev/null 2>&1 || continue
+	parked_panes="$parked_panes $pane"
+	[ "$label" != "$BADGE" ] || continue
 	if [ "${DRY_RUN:-0}" = 1 ]; then
 		printf 'would badge %s (parked, wrapper too old to label itself)\n' "$pane"
 		continue
@@ -535,19 +534,15 @@ done < <(printf '%s' "$panes_json" | jq -r '.result.panes[]? | .pane_id')
 # exactly as they are; only what the sidebar prints changes. Re-reported every
 # pass, which is what keeps the age honest.
 #
-# The badge is the gate, NOT the frame file: a frame survives a wake (it is what
-# a revival keys off, and omp-frozen only drops it when you close the view on
-# purpose), so gating on it labelled every LIVE pane too — a working session
-# advertising `0m · <title>` where it should say `omp` (2026-09-03). A pane that
-# no longer wears the badge gets its label taken back here, so the display never
-# depends on the wake path having fired.
-labelled=$(herdr agent list |
-	jq -r '.result.agents[]? | select(.display_agent) | .pane_id')
+# A frame survives a wake, so track actual parked pagers in the pass above;
+# clearing a live pane's display label must not depend on a stale frame or on
+# the raw agent name (a parked pane now retains the canonical `omp` owner).
+labelled=$(herdr pane list |
+	jq -r '.result.panes[]? | select(.display_agent) | .pane_id')
 while read -r pane; do
 	[ -n "$pane" ] || continue
 	[ -z "$ONLY" ] || [ "$pane" = "$ONLY" ] || continue
-	label=$(printf '%s' "$labels" | awk -F'\t' -v p="$pane" '$1 == p { print $2 }')
-	if [ "$label" != "$BADGE" ]; then
+	if [[ " $parked_panes " != *" $pane "* ]]; then
 		case " $(printf '%s' "$labelled" | tr '\n' ' ') " in
 		*" $pane "*)
 			if [ "${DRY_RUN:-0}" = 1 ]; then
@@ -579,7 +574,7 @@ while read -r pane; do
 		continue
 	fi
 	herdr pane report-metadata "$pane" --source omp-pane \
-		--display-agent "$desc" >/dev/null 2>&1 || true
+		--applies-to-source herdr:omp --display-agent "$desc" >/dev/null 2>&1 || true
 done < <(printf '%s' "$panes_json" | jq -r '.result.panes[]? | .pane_id')
 
 # A herdr restart restores each pane's layout but not its command line, so every

@@ -25,21 +25,15 @@ cursor="$hint_dir/$pane_id.cursor.json"
 frame="$hint_dir/$pane_id.ans"
 mkdir -p "$hint_dir"
 
-# Keep the pane in herdr's agents sidebar while it sleeps, but dimmed.
+# A parked pager cannot report OMP state. Keep the canonical herdr:omp
+# session path, mark it unknown (dimmed), and use display-only metadata for
+# the sleeping label. Explicitly clearing authority would mark this same path
+# stale; a custom omp-pane authority would lose its session identity.
 #
-# herdr identifies an agent by the pane's foreground process name, so a pane
-# parked in a pager would drop off the list. Worse, while the exited omp
-# session still owns the pane, herdr skips detection entirely and the row keeps
-# showing a live green `omp`. `pane.report_agent` is the supported way to fix
-# both: it is the same socket call omp's own herdr integration uses.
-#
-# The sequence number is the whole trick. herdr keeps the last seq per
-# (pane, source) and silently DROPS anything not greater, while still answering
-# `ok` - so an undersized seq looks exactly like a working call that does
-# nothing. omp's integration seeds its counter with `Date.now() * 1000`, i.e.
-# microseconds since the epoch, so `date +%s` is six orders of magnitude too
-# small. One second ahead in microseconds beats everything the dead session
-# emitted, and stays behind whatever the next omp process seeds on wake.
+# Herdr sequences reports per source. The official sleep report uses the
+# current microsecond clock, not a future second, so the next OMP process can
+# immediately supersede it on wake. The legacy custom awake report below has
+# its own sequence counter.
 badge_label="omp (sleeping)"
 
 seq_bump=0
@@ -58,27 +52,26 @@ herdr_req() {
 		nc -U "$sock" >/dev/null 2>&1 || true
 }
 
-# Take the pane over from the session that just exited, then claim it as a
-# dim `unknown` agent: green idle is reserved for a session that can answer.
+# Preserve OMP's session owner across sleep. Clearing herdr:omp authority
+# makes Herdr reject the same session path when the new OMP process wakes.
+# The checkpoint, not a pane label or an old --resume argument, supplies it.
 badge_sleeping() {
-	herdr_req clear_agent_authority ',"source":"herdr:omp"'
-	herdr_req report_agent ",\"source\":\"omp-pane\",\"agent\":\"$badge_label\",\"state\":\"unknown\""
+	local session_file=${checkpoint_session:-}
+	if [ -z "$session_file" ]; then
+		session_file=$(jq -er 'select(.version == 1 and .checkpointed == true)
+			| .sessionFile | select(type == "string" and startswith("/"))' "$cursor" 2>/dev/null) || return 0
+	fi
+	[ -f "$session_file" ] && [ -n "${HERDR_PANE_ID:-}" ] || return 0
+	herdr pane report-agent "$HERDR_PANE_ID" --source herdr:omp --agent omp \
+		--state unknown --agent-session-path "$session_file" \
+		--seq "$(bun -p 'Date.now() * 1000')" >/dev/null 2>&1 || return 0
+	herdr pane report-metadata "$HERDR_PANE_ID" --source omp-pane \
+		--applies-to-source herdr:omp --display-agent "$badge_label" >/dev/null 2>&1 || true
 }
 
-# Hand the pane back as a live row before omp starts.
-#
-# This used to be `release_agent`, on the theory that omp's own integration
-# would own the row again the moment it started. It does — but only on its next
-# state CHANGE, because every painter of that row is edge-triggered: herdr's
-# process detection re-reports when the pane's foreground process GROUP changes,
-# which under a wrapper it never does. So releasing left the pane with no row at
-# all, and a pane that woke straight into a long turn stayed missing from the
-# agents sidebar for as long as that turn ran — 10+ minutes on wD:p1D
-# (2026-08-17), while the work was visibly happening on screen.
-#
-# Reporting a live `omp` instead is never wrong for longer than one omp event:
-# omp's integration outranks this source and takes the row over, session path
-# and all, as soon as it says anything.
+# Drop the display-only sleeping label before launching OMP. The custom report
+# also restores a missing row on legacy wrappers; canonical herdr:omp authority
+# retains the session path and receives the real state from the resumed OMP.
 badge_awake() {
 	herdr_req report_agent ",\"source\":\"omp-pane\",\"agent\":\"omp\",\"state\":\"idle\""
 	# Drop the parked row's `<age> · <title>` display name. It is display-only
