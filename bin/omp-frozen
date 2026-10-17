@@ -106,13 +106,21 @@ build() {
 # the parked marker the reaper's resurrection sweep keys off — nothing displays
 # it.
 renderer=$(command -v omp-render 2>/dev/null || true)
-omp_pkg="$HOME/.bun/install/global/node_modules/@oh-my-pi/pi-coding-agent/package.json"
+omp_mods="$HOME/.bun/install/global/node_modules/@oh-my-pi"
+omp_pkg="$omp_mods/pi-coding-agent/package.json"
 [ -f "$omp_pkg" ] || omp_pkg=
+# A patched runtime rewrites sources under src/ and leaves package.json (and its mtime)
+# alone, so version-only watching kept pre-patch views until the session grew.
+# omp-render imports exactly these two trees. shortcut: a stat walk of a few hundred
+# files per open, fine until the trees grow by orders of magnitude.
+omp_src_newer() {
+	[ -n "$(find "$omp_mods/pi-coding-agent/src" "$omp_mods/pi-tui/src" -type f -newer "$1" -print -quit 2>/dev/null)" ]
+}
 ensure() {
 	local view=$1 mode=$2 cols=$3
 	if [ -f "$view" ] && [ ! "$sess" -nt "$view" ] &&
 		{ [ -z "$renderer" ] || [ ! "$renderer" -nt "$view" ]; } &&
-		{ [ -z "$omp_pkg" ] || [ ! "$omp_pkg" -nt "$view" ]; }; then
+		{ [ -z "$omp_pkg" ] || [ ! "$omp_pkg" -nt "$view" ]; } && ! omp_src_newer "$view"; then
 		return 0
 	fi
 	build "$cols" "$mode" "$view"
